@@ -1,0 +1,5 @@
+{
+  "name": "CRM Miner v2.0",
+  "description": "Buscador de leads inteligente e CRM para prospecção de empresas sem site.",
+  "requestFramePermissions": ["geolocation"]
+}
