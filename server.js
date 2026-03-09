@@ -28,6 +28,9 @@ app.use((req, res, next) => {
     next();
 });
 
+// In-memory storage for shared sites
+const sharedSites = new Map();
+
 // API routes
 app.get('/api/config', (req, res) => {
     res.json({
@@ -150,6 +153,44 @@ app.post('/api/chat', async (req, res) => {
     } catch (error) {
         console.error("Chat error:", error);
         res.status(500).json({ error: "Erro ao processar mensagem no servidor." });
+    }
+});
+
+app.post('/api/demo-chat', async (req, res) => {
+    const { message, history, businessName, niche, city } = req.body;
+    const apiKey = process.env.GEMINI_API_KEY;
+
+    if (!apiKey || apiKey.length < 5) {
+        console.error("Gemini API KEY não configurada no servidor para demo-chat.");
+        return res.status(500).json({ error: "Gemini API KEY não configurada no servidor." });
+    }
+
+    try {
+        const ai = new GoogleGenAI({ apiKey: apiKey.replace(/["']/g, '').trim() });
+        const chat = ai.chats.create({
+            model: "gemini-3-flash-preview",
+            config: {
+                systemInstruction: `Você é um assistente virtual de atendimento ao cliente para a empresa "${businessName}". 
+                O nicho da empresa é "${niche}" e ela está localizada em "${city || 'sua região'}". 
+                Seu objetivo é ser gentil, prestativo e converter o visitante em cliente. 
+                Fale sobre os serviços típicos de ${niche}. 
+                Sempre que apropriado, sugira que o cliente fale no WhatsApp ou agende uma visita usando os botões disponíveis no site. 
+                Se o usuário perguntar quem é você, diga: "Olá! Este é o site de demonstração da empresa ${businessName}. Se desejar mais informações ou agendar atendimento, clique no botão de WhatsApp."
+                Não invente informações específicas que você não tem (como preços exatos ou horários específicos se não foram ditos), foque no que uma empresa de ${niche} normalmente oferece de melhor.
+                Mantenha as respostas curtas, amigáveis e em português do Brasil.`
+            },
+            history: history || []
+        });
+
+        const result = await chat.sendMessage({ message });
+        if (result && result.text) {
+            res.json({ text: result.text });
+        } else {
+            throw new Error("Resposta vazia do Gemini");
+        }
+    } catch (error) {
+        console.error("Demo Chat error:", error);
+        res.status(500).json({ error: "Erro ao processar mensagem no chat demo." });
     }
 });
 
@@ -511,6 +552,30 @@ app.get('/api/geocode', async (req, res) => {
     }
 });
 
+app.get('/api/photo', async (req, res) => {
+    const { name, maxHeightPx, maxWidthPx, key } = req.query;
+    const clientMapsKey = req.headers['x-goog-api-key'] || key;
+    let apiKey = (clientMapsKey && clientMapsKey.trim().length > 5) ? clientMapsKey.trim() : process.env.GOOGLE_MAPS_API_KEY;
+    if (apiKey) apiKey = apiKey.replace(/["']/g, '').replace(/\s/g, '');
+
+    if (!apiKey) {
+        return res.status(500).json({ error: "API KEY do Google Maps não configurada." });
+    }
+
+    if (!name) {
+        return res.status(400).json({ error: "photo name is required" });
+    }
+
+    try {
+        // name is expected to be like "places/PLACE_ID/photos/PHOTO_REFERENCE"
+        const url = `https://places.googleapis.com/v1/${name}/media?key=${apiKey}&maxHeightPx=${maxHeightPx || 1200}&maxWidthPx=${maxWidthPx || 1920}`;
+        res.redirect(url);
+    } catch (error) {
+        console.error("Photo proxy error:", error);
+        res.status(500).json({ error: "Erro ao acessar Google Photo API" });
+    }
+});
+
 app.get('/api/enrich', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: "URL is required" });
@@ -551,6 +616,30 @@ app.get('/api/enrich', async (req, res) => {
         console.error(`Enrichment error for ${url}:`, msg);
         res.status(500).json({ error: msg });
     }
+});
+
+app.post('/api/share-site', (req, res) => {
+    const { html } = req.body;
+    if (!html) return res.status(400).json({ error: "HTML content is required" });
+
+    const id = Math.random().toString(36).substring(2, 15);
+    sharedSites.set(id, html);
+    
+    // Auto-delete after 24 hours to save memory
+    setTimeout(() => sharedSites.delete(id), 24 * 60 * 60 * 1000);
+
+    res.json({ id });
+});
+
+app.get('/share/:id', (req, res) => {
+    const { id } = req.params;
+    const html = sharedSites.get(id);
+    
+    if (!html) {
+        return res.status(404).send('<h1>Site não encontrado ou expirado</h1><p>Links de demonstração expiram após 24 horas.</p>');
+    }
+    
+    res.send(html);
 });
 
 // Serve static files from the root directory

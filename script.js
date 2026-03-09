@@ -53,7 +53,9 @@ let state = {
         found: 0,
         saved: 0,
         duplicates: 0,
-        currentPage: 1
+        currentPage: 1,
+        lastQueryIndex: 0,
+        lastPointIndex: 0
     },
     filterStatus: "Todos",
     filterType: "Todos",
@@ -90,6 +92,8 @@ let state = {
     rankingKeyword: "",
     showDemoLibrary: false,
     siteGenerationMode: 'auto', // 'auto' | 'template' | 'screenshot' | 'link'
+    currentShareUrl: null,
+    isPublishing: false,
     meetings: JSON.parse(localStorage.getItem('crm_meetings') || '[]'),
     filterAgenda: 'Hoje', // 'Hoje' | 'Amanhã' | 'Semana' | 'Todas'
     showMeetingModal: false,
@@ -109,6 +113,7 @@ let state = {
     keyVerificationResults: JSON.parse(localStorage.getItem('api_verification_results') || 'null'),
     isVerifyingKeys: false,
     apiStatusOk: false,
+    uploadedPhotos: [], // { id, url, name, placement }
     assistantMessages: [
         { 
             role: 'model', 
@@ -1199,9 +1204,16 @@ async function startSmartProspectingMode(type) {
     }
 }
 
-async function searchLeads() {
-    console.log("Action: searchLeads triggered");
+async function searchLeads(clearCurrent = false, resume = false) {
+    console.log("Action: searchLeads triggered", { clearCurrent, resume });
     
+    // Read from search-input if available
+    const searchInput = document.getElementById('search-input');
+    if (searchInput && searchInput.value.trim()) {
+        state.customNiche = searchInput.value.trim();
+        state.niche = searchInput.value.trim();
+    }
+
     // Check if keys are configured (lightweight check)
     const isMapsConfigured = hasGoogleMapsKey || (state.googleMapsKey && state.googleMapsKey.replace(/["']\s/g, '').length > 10);
     const isGeminiConfigured = hasGeminiKey || (state.geminiKey && state.geminiKey.replace(/["']\s/g, '').length > 10);
@@ -1236,21 +1248,37 @@ async function searchLeads() {
         return;
     }
 
+    if (clearCurrent) {
+        state.leads = [];
+        state.selectedLeads = [];
+        saveLeads();
+        state.miningStatus.lastQueryIndex = 0;
+        state.miningStatus.lastPointIndex = 0;
+    }
+
     const query = state.niche === "Todos os Nichos" ? "comércio local" : state.niche;
 
-    // Reset mining status
-    state.miningStatus = {
-        active: true,
-        paused: false,
-        currentPoint: 0,
-        totalPoints: 0,
-        currentQuery: 0,
-        totalQueries: 0,
-        found: 0,
-        saved: 0,
-        duplicates: 0,
-        currentPage: 1
-    };
+    if (!resume) {
+        // Reset mining status only if not resuming
+        state.miningStatus = {
+            ...state.miningStatus,
+            active: true,
+            paused: false,
+            currentPoint: 0,
+            totalPoints: 0,
+            currentQuery: 0,
+            totalQueries: 0,
+            found: 0,
+            saved: 0,
+            duplicates: 0,
+            currentPage: 1,
+            lastQueryIndex: 0,
+            lastPointIndex: 0
+        };
+    } else {
+        state.miningStatus.active = true;
+        state.miningStatus.paused = false;
+    }
     state.loading = true;
     state.stopSearch = false;
     state.error = null;
@@ -1301,20 +1329,25 @@ async function searchLeads() {
     const seenPlaceIds = new Set(state.leads.map(l => l.placeId).filter(Boolean));
     const seenFallbacks = new Set(state.leads.map(l => `${l.name.toLowerCase()}|${l.address.toLowerCase()}`));
 
+    const baseLimit = (state.economyMode || window.innerWidth < 768) ? 20 : state.maxLeadsPerRound;
+    const maxLeads = clearCurrent ? baseLimit : state.leads.length + baseLimit;
+    
     try {
-        for (let qIdx = 0; qIdx < queries.length; qIdx++) {
-            if (state.stopSearch) break;
+        for (let qIdx = state.miningStatus.lastQueryIndex; qIdx < queries.length; qIdx++) {
+            if (state.stopSearch || state.leads.length >= maxLeads) break;
             state.miningStatus.currentQuery = qIdx + 1;
+            state.miningStatus.lastQueryIndex = qIdx;
             const query = queries[qIdx];
 
-            for (let pIdx = 0; pIdx < gridPoints.length; pIdx++) {
-                if (state.stopSearch) break;
+            const startPIdx = (qIdx === state.miningStatus.lastQueryIndex) ? state.miningStatus.lastPointIndex : 0;
+            for (let pIdx = startPIdx; pIdx < gridPoints.length; pIdx++) {
+                if (state.stopSearch || state.leads.length >= maxLeads) break;
                 
-                // Pause handling
+                state.miningStatus.lastPointIndex = pIdx;
                 while (state.miningStatus.paused && !state.stopSearch) {
                     await new Promise(r => setTimeout(r, 500));
                 }
-                if (state.stopSearch) break;
+                if (state.stopSearch || state.leads.length >= maxLeads) break;
 
                 state.miningStatus.currentPoint = pIdx + 1;
                 const point = gridPoints[pIdx];
@@ -1325,12 +1358,12 @@ async function searchLeads() {
                 let hasNextPage = true;
                 state.miningStatus.currentPage = 1;
 
-                while (hasNextPage && !state.stopSearch) {
+                while (hasNextPage && !state.stopSearch && state.leads.length < maxLeads) {
                     // Pause handling inside pagination
                     while (state.miningStatus.paused && !state.stopSearch) {
                         await new Promise(r => setTimeout(r, 500));
                     }
-                    if (state.stopSearch) break;
+                    if (state.stopSearch || state.leads.length >= maxLeads) break;
 
                     render();
 
@@ -1342,58 +1375,49 @@ async function searchLeads() {
                         headers['x-goog-api-key'] = cleanMapsKey;
                     }
 
-                    const response = await fetch('/api/mine', {
-                        method: 'POST',
-                        headers,
-                        body: JSON.stringify({
-                            query,
-                            location,
-                            radius,
-                            pageToken
-                        })
-                    });
-                    
-                    const contentType = response.headers.get("content-type");
-                    if (!response.ok) {
-                        let errorMsg = `Erro no servidor (${response.status})`;
-                        if (contentType && contentType.includes("application/json")) {
-                            const errorData = await response.json();
-                            errorMsg = errorData.error || errorMsg;
-                        } else {
-                            const text = await response.text();
-                            console.error("Server returned non-JSON error:", text);
-                            if (text.includes('<html')) {
-                                errorMsg = "O servidor retornou uma página de erro HTML (404 ou 500). Isso pode indicar que a rota /api/mine não foi encontrada ou o servidor caiu. Verifique os logs do console.";
-                            } else {
-                                errorMsg = "O servidor retornou uma resposta inválida: " + text.substring(0, 100);
+                    let retries = 0;
+                    const maxRetries = 2;
+                    let data = null;
+
+                    while (retries <= maxRetries) {
+                        try {
+                            const response = await fetch('/api/mine', {
+                                method: 'POST',
+                                headers,
+                                body: JSON.stringify({
+                                    query,
+                                    location,
+                                    radius,
+                                    pageToken
+                                })
+                            });
+                            
+                            const contentType = response.headers.get("content-type");
+                            if (!response.ok) {
+                                let errorMsg = `Erro no servidor (${response.status})`;
+                                if (contentType && contentType.includes("application/json")) {
+                                    const errorData = await response.json();
+                                    errorMsg = errorData.error || errorMsg;
+                                }
+                                throw new Error(errorMsg);
                             }
-                        }
-                        throw new Error(errorMsg);
-                    }
 
-                    if (!contentType || !contentType.includes("application/json")) {
-                        const text = await response.text();
-                        console.error("Expected JSON but got:", text);
-                        throw new Error("O servidor retornou uma resposta inválida (não-JSON). Verifique se o servidor está rodando corretamente.");
-                    }
-
-                    const data = await response.json();
-
-                    if (data.error) {
-                        console.error("API Error:", data.error);
-                        state.error = `Erro na API: ${data.error}. Verifique se sua chave está correta nas configurações e use o botão 'Diagnosticar'.`;
-                        
-                        // If it's an auth error, update the status
-                        if (data.error.toLowerCase().includes('chave') || data.error.toLowerCase().includes('api key') || data.error.toLowerCase().includes('inválida') || data.error.toLowerCase().includes('negado')) {
-                            if (state.keyVerificationResults) {
-                                state.keyVerificationResults.googleMaps = { status: 'error', message: data.error };
-                                localStorage.setItem('api_verification_results', JSON.stringify(state.keyVerificationResults));
+                            if (!contentType || !contentType.includes("application/json")) {
+                                throw new Error("Resposta inválida do servidor (não-JSON)");
                             }
+
+                            data = await response.json();
+                            if (data.error) throw new Error(data.error);
+                            break; // Success
+                        } catch (err) {
+                            retries++;
+                            console.warn(`Tentativa ${retries} falhou: ${err.message}`);
+                            if (retries > maxRetries) {
+                                state.error = `Erro na mineração: ${err.message}`;
+                                throw err;
+                            }
+                            await new Promise(r => setTimeout(r, 2000 * retries)); // Exponential backoff
                         }
-                        
-                        state.stopSearch = true; // Stop everything on API error
-                        render();
-                        break;
                     }
 
                     const results = data.results || [];
@@ -1436,6 +1460,13 @@ async function searchLeads() {
                                     }
                                     if (details.formatted_phone_number || details.international_phone_number) {
                                         phone = cleanPhoneNumber(details.international_phone_number || details.formatted_phone_number);
+                                    }
+                                    // SAVE PHOTOS FROM DETAILS
+                                    if (details.photos && details.photos.length > 0) {
+                                        item.photos = details.photos;
+                                    }
+                                    if (details.types && details.types.length > 0) {
+                                        item.types = details.types;
                                     }
                                 }
                             } catch (err) {
@@ -1504,6 +1535,12 @@ async function searchLeads() {
                 // Small delay between grid points
                 await new Promise(r => setTimeout(r, 500));
             }
+        }
+        
+        // If we reached here without breaking, we finished all queries and points
+        if (!state.stopSearch && state.leads.length < maxLeads) {
+            state.miningStatus.lastQueryIndex = 0;
+            state.miningStatus.lastPointIndex = 0;
         }
     } catch (err) {
         state.error = `Erro na mineração: ${err.message || "Falha na comunicação com o servidor."}`;
@@ -1605,20 +1642,48 @@ function copyProspectingMessage(lead) {
     });
 }
 
+function clearLeads() {
+    if (confirm('Limpar todos os leads e parar mineração ativa?')) {
+        state.stopSearch = true;
+        state.leads = [];
+        state.selectedLeads = [];
+        state.miningStatus = {
+            active: false,
+            paused: false,
+            currentPoint: 0,
+            totalPoints: 0,
+            currentQuery: 0,
+            totalQueries: 0,
+            found: 0,
+            saved: 0,
+            duplicates: 0,
+            currentPage: 1
+        };
+        saveLeads();
+        render();
+    }
+}
+
 function downloadCSV() {
     console.log("Action: downloadCSV triggered");
     if (state.leads.length === 0) return;
     
-    const headers = ["Nome", "Cidade", "Telefone", "Rating", "Reviews", "Website", "Qualidade GMN", "Oportunidade", "Status", "Valor"];
+    const headers = ["Nome", "Telefone", "Endereço", "Website", "Avaliação", "Quantidade de avaliações", "Link Google Maps"];
     const rows = state.leads.map(l => [
-        l.name, l.city, l.phone, l.rating, l.reviews, l.website || "Sem site",
-        getGMNQuality(l), getOpportunity(l), l.status, l.value || 0
+        `"${l.name || ''}"`, 
+        `"${l.phone || ''}"`, 
+        `"${l.address || ''}"`, 
+        `"${l.website || 'Sem site'}"`, 
+        l.rating || 0, 
+        l.reviews || 0, 
+        `"${l.mapsLink || ''}"`
     ]);
     
-    let csvContent = "data:text/csv;charset=utf-8," + [headers, ...rows].map(e => e.join(",")).join("\n");
-    const encodedUri = encodeURI(csvContent);
+    let csvContent = "\uFEFF" + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
+    link.setAttribute("href", url);
     link.setAttribute("download", `leads_${state.city}_${new Date().toLocaleDateString()}.csv`);
     document.body.appendChild(link);
     link.click();
@@ -1740,6 +1805,29 @@ function render() {
         if (window.lucide) {
             lucide.createIcons();
         }
+
+        // Update the iframe content after render
+        // Demo Preview Frame
+        if (state.selectedLeadForSite && state.siteDraft && !state.isGeneratingSite) {
+            const frame = document.getElementById('demo-preview-frame');
+            if (frame) {
+                const doc = frame.contentDocument || frame.contentWindow.document;
+                doc.open();
+                doc.write(state.siteDraft);
+                doc.close();
+            }
+        }
+        
+        // Smart Prospecting Preview Frame
+        if (state.selectedLeadForSmartProspecting && state.siteDraft && !state.isGeneratingSite) {
+            const frame = document.getElementById('smart-preview-frame');
+            if (frame) {
+                const doc = frame.contentDocument || frame.contentWindow.document;
+                doc.open();
+                doc.write(state.siteDraft);
+                doc.close();
+            }
+        }
     } catch (err) {
         console.error("Render error:", err);
     }
@@ -1816,6 +1904,12 @@ function getMeetingModalHTML() {
 }
 
 function renderChatbot(container) {
+    if (!state.chatMessages) {
+        state.chatMessages = [
+            { role: 'assistant', text: "Olá! Sou o assistente do CRM Miner. Posso ajudar com mineração, CSV e geração de sites." }
+        ];
+    }
+
     container.innerHTML = `
         <div class="flex flex-col lg:grid lg:grid-cols-12 min-h-screen bg-slate-50">
             <!-- Sidebar -->
@@ -1855,151 +1949,37 @@ function renderChatbot(container) {
             </aside>
 
             <!-- Main Content -->
-            <main class="lg:col-span-9 p-6 space-y-6">
-                <!-- Header -->
-                <header class="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                    <div>
-                        <h2 class="text-3xl font-black tracking-tight text-slate-900">Assistente Chatbot</h2>
-                        <p class="text-slate-500 font-medium">Automação de atendimento para novos leads.</p>
-                    </div>
-                    <div class="flex items-center gap-3">
-                        <div class="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-xl">
-                            <span class="text-[10px] font-black uppercase tracking-widest text-slate-400">Status:</span>
-                            <div class="flex items-center gap-1.5">
-                                <div class="w-2 h-2 rounded-full ${state.chatbotEnabled ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}"></div>
-                                <span class="text-[10px] font-black uppercase tracking-widest ${state.chatbotEnabled ? 'text-emerald-600' : 'text-slate-400'}">
-                                    ${state.chatbotEnabled ? 'Ativo' : 'Inativo'}
-                                </span>
-                            </div>
-                        </div>
-                        <button onclick="toggleChatbot()" class="px-6 py-4 ${state.chatbotEnabled ? 'bg-red-50 text-red-600 hover:bg-red-100' : 'bg-indigo-600 text-white hover:bg-indigo-700'} rounded-2xl font-black text-xs uppercase tracking-widest transition-all active:scale-95 cursor-pointer shadow-xl ${state.chatbotEnabled ? 'shadow-red-100' : 'shadow-indigo-200'}">
-                            ${state.chatbotEnabled ? 'Desativar Chatbot' : 'Ativar Chatbot'}
-                        </button>
-                    </div>
+            <main class="lg:col-span-9 p-6 flex flex-col h-screen">
+                <header class="mb-6">
+                    <h2 class="text-3xl font-black tracking-tight text-slate-900">Chatbot</h2>
+                    <p class="text-slate-500 font-medium">Assistente inteligente para suporte e automação.</p>
                 </header>
 
-                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                    <!-- Settings -->
-                    <div class="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-100 space-y-8">
-                        <div class="flex items-center gap-4">
-                            <div class="p-3 bg-indigo-50 text-indigo-600 rounded-2xl">
-                                <i data-lucide="message-square" class="w-6 h-6"></i>
-                            </div>
-                            <h3 class="text-xl font-black tracking-tight text-slate-900">Configurações de Resposta</h3>
-                        </div>
-
-                        <div class="space-y-6">
-                            <div class="space-y-3">
-                                <label class="text-[11px] font-black uppercase tracking-[0.2em] text-slate-400 ml-1">Mensagem de Saudação</label>
-                                <textarea 
-                                    id="chatbot-greeting"
-                                    class="w-full p-5 bg-slate-50 border border-slate-100 rounded-2xl text-sm font-bold focus:ring-8 focus:ring-indigo-500/5 focus:border-indigo-500/20 outline-none transition-all min-h-[150px]"
-                                    placeholder="Olá 👋..."
-                                >${state.chatbotSettings.greeting}</textarea>
-                            </div>
-
-                            <div class="space-y-4">
-                                <div class="flex items-center justify-between">
-                                    <h4 class="text-[11px] font-black uppercase tracking-[0.2em] text-slate-400 ml-1">Fluxos de Opções</h4>
-                                    <span class="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-2 py-1 rounded-lg">Automático</span>
-                                </div>
-                                
-                                <div class="space-y-4">
-                                    <div class="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-2">
-                                        <div class="flex items-center gap-2 text-[10px] font-black text-slate-900 uppercase tracking-widest">
-                                            <span class="w-5 h-5 bg-white rounded-lg flex items-center justify-center border border-slate-200">1</span>
-                                            Opção Website
-                                        </div>
-                                        <p class="text-xs text-slate-500 font-medium leading-relaxed">${state.chatbotSettings.options[1].substring(0, 100)}...</p>
-                                    </div>
-                                    <div class="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-2">
-                                        <div class="flex items-center gap-2 text-[10px] font-black text-slate-900 uppercase tracking-widest">
-                                            <span class="w-5 h-5 bg-white rounded-lg flex items-center justify-center border border-slate-200">2</span>
-                                            Opção Google Maps
-                                        </div>
-                                        <p class="text-xs text-slate-500 font-medium leading-relaxed">${state.chatbotSettings.options[2]}</p>
-                                    </div>
-                                    <div class="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-2">
-                                        <div class="flex items-center gap-2 text-[10px] font-black text-slate-900 uppercase tracking-widest">
-                                            <span class="w-5 h-5 bg-white rounded-lg flex items-center justify-center border border-slate-200">3</span>
-                                            Opção Exemplo
-                                        </div>
-                                        <p class="text-xs text-slate-500 font-medium leading-relaxed">Envia automaticamente um link de demonstração gerado pela IA.</p>
-                                    </div>
+                <div class="flex-1 bg-white rounded-[2.5rem] shadow-sm border border-slate-100 flex flex-col overflow-hidden">
+                    <!-- Messages Area -->
+                    <div id="chat-messages" class="flex-1 p-6 overflow-y-auto space-y-4 no-scrollbar">
+                        ${state.chatMessages.map(msg => `
+                            <div class="flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}">
+                                <div class="max-w-[80%] p-4 rounded-2xl ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-slate-100 text-slate-800 rounded-tl-none'}">
+                                    <p class="text-sm font-medium leading-relaxed">${msg.text}</p>
                                 </div>
                             </div>
-
-                            <button onclick="saveChatbotSettings()" class="w-full py-5 bg-slate-900 text-white rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-slate-800 transition-all active:scale-95 cursor-pointer shadow-xl shadow-slate-200">
-                                Salvar Configurações
-                            </button>
-                        </div>
+                        `).join('')}
                     </div>
 
-                    <!-- History / Simulation -->
-                    <div class="flex flex-col gap-6">
-                        <div class="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-100 flex-1 flex flex-col">
-                            <div class="flex items-center justify-between mb-8">
-                                <div class="flex items-center gap-4">
-                                    <div class="p-3 bg-emerald-50 text-emerald-600 rounded-2xl">
-                                        <i data-lucide="history" class="w-6 h-6"></i>
-                                    </div>
-                                    <h3 class="text-xl font-black tracking-tight text-slate-900">Histórico Recente</h3>
-                                </div>
-                                <button onclick="simulateChatbotMessage()" class="p-3 bg-slate-50 text-slate-400 rounded-xl hover:text-indigo-600 hover:bg-indigo-50 transition-all active:scale-90 cursor-pointer" title="Simular Nova Mensagem">
-                                    <i data-lucide="play" class="w-5 h-5"></i>
-                                </button>
-                            </div>
-
-                            <div class="flex-1 overflow-y-auto space-y-4 no-scrollbar max-h-[400px]">
-                                ${state.chatbotHistory.length === 0 ? `
-                                    <div class="h-full flex flex-col items-center justify-center text-center space-y-4 opacity-40">
-                                        <i data-lucide="message-circle" class="w-12 h-12"></i>
-                                        <p class="text-sm font-bold uppercase tracking-widest">Nenhuma interação ainda</p>
-                                    </div>
-                                ` : state.chatbotHistory.map(h => `
-                                    <div class="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-3">
-                                        <div class="flex items-center justify-between">
-                                            <div class="flex items-center gap-2">
-                                                <div class="w-8 h-8 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center text-[10px] font-black">
-                                                    ${h.phone.substring(h.phone.length - 2)}
-                                                </div>
-                                                <div class="flex flex-col">
-                                                    <span class="text-xs font-black text-slate-900">${h.phone}</span>
-                                                    <span class="text-[8px] font-bold text-slate-400 uppercase tracking-widest">${new Date(h.timestamp).toLocaleString('pt-BR')}</span>
-                                                </div>
-                                            </div>
-                                            <span class="px-2 py-1 bg-emerald-50 text-emerald-600 text-[8px] font-black uppercase tracking-widest rounded-lg border border-emerald-100">
-                                                Auto-Respondido
-                                            </span>
-                                        </div>
-                                        <div class="text-[10px] font-medium text-slate-600 bg-white p-3 rounded-xl border border-slate-100 italic">
-                                            "${h.lastMessage}"
-                                        </div>
-                                    </div>
-                                `).join('')}
-                            </div>
-                        </div>
-
-                        <!-- Protection Info -->
-                        <div class="bg-indigo-600 p-8 rounded-[2.5rem] shadow-xl shadow-indigo-200 text-white space-y-4">
-                            <div class="flex items-center gap-3">
-                                <i data-lucide="shield-check" class="w-6 h-6"></i>
-                                <h4 class="text-lg font-black tracking-tight">Proteção Ativa</h4>
-                            </div>
-                            <p class="text-indigo-100 text-sm font-medium leading-relaxed">
-                                O chatbot ignora automaticamente números que já estão no seu CRM ou na sua lista de contatos para evitar interrupções em negociações em andamento.
-                            </p>
-                            <div class="flex items-center gap-4 pt-2">
-                                <div class="flex items-center gap-2">
-                                    <div class="w-1.5 h-1.5 bg-emerald-400 rounded-full"></div>
-                                    <span class="text-[10px] font-black uppercase tracking-widest">Loop Protection</span>
-                                </div>
-                                <div class="flex items-center gap-2">
-                                    <div class="w-1.5 h-1.5 bg-emerald-400 rounded-full"></div>
-                                    <span class="text-[10px] font-black uppercase tracking-widest">AI Fallback</span>
-                                </div>
-                            </div>
-                        </div>
+                    <!-- Input Area -->
+                    <div class="p-6 border-t border-slate-100 bg-slate-50/50">
+                        <form id="chat-form" class="flex gap-3">
+                            <input 
+                                type="text" 
+                                id="chat-input"
+                                placeholder="Digite sua mensagem..." 
+                                class="flex-1 px-6 py-4 bg-white border border-slate-200 rounded-2xl font-bold text-slate-900 outline-none focus:border-indigo-600 transition-all"
+                            />
+                            <button type="submit" class="p-4 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-all active:scale-95 shadow-lg shadow-indigo-100">
+                                <i data-lucide="send" class="w-6 h-6"></i>
+                            </button>
+                        </form>
                     </div>
                 </div>
             </main>
@@ -2014,7 +1994,54 @@ function renderChatbot(container) {
     document.getElementById('nav-campaign-btn').onclick = () => { state.view = 'campaigns'; render(); };
     document.getElementById('nav-chatbot-btn').onclick = () => { state.view = 'chatbot'; render(); };
 
+    const chatForm = document.getElementById('chat-form');
+    const chatInput = document.getElementById('chat-input');
+    const messagesArea = document.getElementById('chat-messages');
+
+    chatForm.onsubmit = async (e) => {
+        e.preventDefault();
+        const text = chatInput.value.trim();
+        if (!text) return;
+
+        state.chatMessages.push({ role: 'user', text });
+        chatInput.value = '';
+        renderChatbot(container); // Re-render to show user message
+
+        // Automated response using Gemini if available
+        try {
+            const cleanGeminiKey = (state.geminiKey || "").trim().replace(/["']/g, '').replace(/\s/g, '');
+            let responseText = "";
+
+            if (cleanGeminiKey) {
+                const ai = new GoogleGenAI({ apiKey: cleanGeminiKey });
+                const chat = ai.chats.create({
+                    model: "gemini-3-flash-preview",
+                    config: {
+                        systemInstruction: "Você é o assistente inteligente do CRM Miner. Ajude o usuário com dúvidas sobre mineração de leads, exportação de CSV, geração de sites demo e gestão de campanhas. Seja curto, direto e profissional. Se o usuário perguntar sobre mineração, diga que ele pode fazer isso no Dashboard. Se perguntar sobre CSV, diga que o botão está no topo da lista de leads.",
+                    }
+                });
+                const result = await chat.sendMessage({ message: text });
+                responseText = result.text;
+            } else {
+                // Fallback to simple responses
+                responseText = "Entendi! Como posso ajudar com isso? (Configure sua chave Gemini para respostas mais inteligentes)";
+                if (text.toLowerCase().includes('mineração')) responseText = "A mineração pode ser iniciada no Dashboard. Basta escolher o nicho e a cidade!";
+                if (text.toLowerCase().includes('csv')) responseText = "Você pode exportar seus leads para CSV clicando no botão 'Exportar CSV' no Dashboard.";
+                if (text.toLowerCase().includes('site')) responseText = "Para gerar um site demo, clique no botão 'Gerar Site' em qualquer lead no Dashboard.";
+            }
+            
+            state.chatMessages.push({ role: 'assistant', text: responseText });
+            renderChatbot(container);
+            messagesArea.scrollTop = messagesArea.scrollHeight;
+        } catch (err) {
+            console.error("Chatbot error:", err);
+            state.chatMessages.push({ role: 'assistant', text: "Desculpe, tive um erro ao processar sua mensagem. Verifique sua conexão ou chave de API." });
+            renderChatbot(container);
+        }
+    };
+
     if (window.lucide) lucide.createIcons();
+    messagesArea.scrollTop = messagesArea.scrollHeight;
 }
 
 function toggleChatbot() {
@@ -2227,6 +2254,7 @@ function renderAgenda(container) {
     document.getElementById('nav-dash-btn').onclick = () => { state.view = 'dashboard'; render(); };
     document.getElementById('nav-agenda-btn').onclick = () => { state.view = 'agenda'; render(); };
     document.getElementById('nav-campaign-btn').onclick = () => { state.view = 'campaigns'; render(); };
+    document.getElementById('nav-chatbot-btn').onclick = () => { state.view = 'chatbot'; render(); };
     
     if (window.lucide) lucide.createIcons();
 }
@@ -2850,6 +2878,7 @@ function renderCampaigns(container) {
     document.getElementById('nav-dash-btn').onclick = () => { state.view = 'dashboard'; render(); };
     document.getElementById('nav-agenda-btn').onclick = () => { state.view = 'agenda'; render(); };
     document.getElementById('nav-campaign-btn').onclick = () => { state.view = 'campaigns'; render(); };
+    document.getElementById('nav-chatbot-btn').onclick = () => { state.view = 'chatbot'; render(); };
     
     if (window.lucide) lucide.createIcons();
     
@@ -3139,12 +3168,23 @@ function renderDashboard(container) {
                                     </button>
                                 </div>
                             </div>
+                        ` : (state.miningStatus.lastQueryIndex > 0 || state.miningStatus.lastPointIndex > 0 ? `
+                            <div class="space-y-3">
+                                <button onclick="searchLeads(false, true)" class="w-full py-4 bg-amber-500 text-white rounded-2xl font-black text-xs shadow-lg shadow-amber-100 hover:bg-amber-600 transition-all active:scale-95 cursor-pointer flex items-center justify-center gap-2">
+                                    <i data-lucide="play" class="w-4 h-4"></i>
+                                    RETOMAR MINERAÇÃO
+                                </button>
+                                <button onclick="searchLeads(true)" class="w-full py-4 bg-indigo-600 text-white rounded-2xl font-black text-xs shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-all active:scale-95 cursor-pointer flex items-center justify-center gap-2">
+                                    <i data-lucide="zap" class="w-4 h-4"></i>
+                                    NOVA MINERAÇÃO
+                                </button>
+                            </div>
                         ` : `
-                            <button onclick="searchLeads()" class="w-full py-4 bg-indigo-600 text-white rounded-2xl font-black text-xs shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-all active:scale-95 cursor-pointer flex items-center justify-center gap-2">
+                            <button onclick="searchLeads(true)" class="w-full py-4 bg-indigo-600 text-white rounded-2xl font-black text-xs shadow-lg shadow-indigo-100 hover:bg-indigo-700 transition-all active:scale-95 cursor-pointer flex items-center justify-center gap-2">
                                 <i data-lucide="zap" class="w-4 h-4"></i>
                                 NOVA MINERAÇÃO
                             </button>
-                        `}
+                        `)}
                     </div>
                 </div>
             </aside>
@@ -3162,27 +3202,9 @@ function renderDashboard(container) {
                             <i data-lucide="download" class="w-4 h-4"></i>
                             EXPORTAR CSV
                         </button>
-                        <button onclick="if(confirm('Limpar todos os leads e parar mineração ativa?')) { 
-                            state.stopSearch = true;
-                            state.leads = []; 
-                            state.selectedLeads = [];
-                            state.miningStatus = {
-                                active: false,
-                                paused: false,
-                                currentPoint: 0,
-                                totalPoints: 0,
-                                currentQuery: 0,
-                                totalQueries: 0,
-                                found: 0,
-                                saved: 0,
-                                duplicates: 0,
-                                currentPage: 1
-                            };
-                            saveLeads(); 
-                            render(); 
-                        }" class="px-5 py-3 bg-red-50 text-red-600 rounded-2xl text-xs font-black hover:bg-red-100 transition-all active:scale-95 cursor-pointer flex items-center gap-2">
+                        <button onclick="clearLeads()" class="px-5 py-3 bg-red-50 border border-red-100 rounded-2xl text-xs font-black text-red-600 hover:bg-red-100 transition-all active:scale-95 cursor-pointer flex items-center gap-2">
                             <i data-lucide="trash-2" class="w-4 h-4"></i>
-                            LIMPAR TUDO
+                            LIMPAR LISTA
                         </button>
                     </div>
                 </header>
@@ -3370,6 +3392,15 @@ function renderDashboard(container) {
                             </tbody>
                         </table>
                     </div>
+                    
+                    ${state.leads.length >= 20 && !state.miningStatus.active ? `
+                        <div class="flex justify-center pt-8">
+                            <button onclick="searchLeads(false)" class="px-8 py-4 bg-white border border-slate-200 text-slate-600 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-slate-50 transition-all active:scale-95 cursor-pointer shadow-sm flex items-center gap-3">
+                                <i data-lucide="plus" class="w-4 h-4"></i>
+                                Carregar mais resultados
+                            </button>
+                        </div>
+                    ` : ''}
                 </div>
             </main>
         </div>
@@ -3381,43 +3412,36 @@ function renderDashboard(container) {
     document.getElementById('nav-dash-btn').onclick = () => { state.view = 'dashboard'; render(); };
     document.getElementById('nav-agenda-btn').onclick = () => { state.view = 'agenda'; render(); };
     document.getElementById('nav-campaign-btn').onclick = () => { state.view = 'campaigns'; render(); };
+    document.getElementById('nav-chatbot-btn').onclick = () => { state.view = 'chatbot'; render(); };
     
     if (window.lucide) lucide.createIcons();
 }
 
 // --- Global Actions for Inline Events ---
 window.state = state;
-window.render = render;
 window.saveSettings = saveSettings;
 window.saveLeads = saveLeads;
-window.searchLeads = searchLeads;
-window.enrichLeads = enrichLeads;
-window.downloadCSV = downloadCSV;
-window.copyProspectingMessage = copyProspectingMessage;
-window.toggleLeadSelection = toggleLeadSelection;
-window.sendMessageAssistant = sendMessageAssistant;
-window.generateDemoSite = generateDemoSite;
-window.downloadDemoHTML = downloadDemoHTML;
-window.copyDemoLink = copyDemoLink;
-window.openDemoInNewTab = openDemoInNewTab;
-window.openAuditPanel = openAuditPanel;
-window.generateProspectingMessage = generateProspectingMessage;
-window.checkRanking = checkRanking;
-window.updateMeetingStatus = updateMeetingStatus;
-window.deleteMeeting = deleteMeeting;
-window.getOpportunityColor = getOpportunityColor;
-window.getOpportunityLabel = getOpportunityLabel;
-window.previewLibrarySite = previewLibrarySite;
-window.duplicateLibrarySite = duplicateLibrarySite;
-window.deleteLibrarySite = deleteLibrarySite;
-window.openSiteGenerator = (leadId) => {
+window.handleManualPhotoUpload = handleManualPhotoUpload;
+window.updatePhotoPlacement = updatePhotoPlacement;
+window.removeUploadedPhoto = removeUploadedPhoto;
+function openSiteGenerator(leadId) {
     const lead = state.leads.find(l => l.id === leadId);
-    if (lead) {
-        state.selectedLeadForSite = lead;
-        state.view = 'dashboard'; // Ensure we are on dashboard to show site gen
-        render();
+    if (!lead) return;
+    
+    if (!state.selectedLeadForSite || state.selectedLeadForSite.id !== leadId) {
+        state.uploadedPhotos = [];
     }
-};
+    state.selectedLeadForSite = lead;
+    state.siteDraft = "";
+    state.isGeneratingSite = true;
+    state.view = 'dashboard';
+    render();
+    
+    // Start generation automatically to restore previous flow
+    generateDemoSite(leadId, 'auto', null, 1);
+}
+
+window.openSiteGenerator = openSiteGenerator;
 
 const NICHE_TEMPLATES = {
     "Salão de Beleza": {
@@ -3436,7 +3460,8 @@ const NICHE_TEMPLATES = {
             "https://images.unsplash.com/photo-1487412947147-5cebf100ffc2?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1616394584738-fc6e612e71b9?auto=format&fit=crop&w=400&q=80"
-        ]
+        ],
+        chatbotFallback: ["Agendar horário", "Ver serviços", "Falar no WhatsApp"]
     },
     "Barbearia": {
         primary: "#000000", // black
@@ -3454,7 +3479,8 @@ const NICHE_TEMPLATES = {
             "https://images.unsplash.com/photo-1593702295094-2825834931fb?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1599351431247-f5793384797d?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1503951914875-452162b0f3f1?auto=format&fit=crop&w=400&q=80"
-        ]
+        ],
+        chatbotFallback: ["Agendar horário", "Ver preços", "Falar no WhatsApp"]
     },
     "Clínica Estética": {
         primary: "#3b82f6", // blue-500
@@ -3472,7 +3498,8 @@ const NICHE_TEMPLATES = {
             "https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1570172619644-dfd03ed5d881?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1515377905703-c4788e51af15?auto=format&fit=crop&w=400&q=80"
-        ]
+        ],
+        chatbotFallback: ["Agendar avaliação", "Ver tratamentos", "Falar no WhatsApp"]
     },
     "Dentista": {
         primary: "#0ea5e9", // sky-500
@@ -3490,7 +3517,8 @@ const NICHE_TEMPLATES = {
             "https://images.unsplash.com/photo-1598256989800-fe5f95da9787?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1629909613654-28e377c37b09?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1516062423079-7ca13cdc7f5a?auto=format&fit=crop&w=400&q=80"
-        ]
+        ],
+        chatbotFallback: ["Agendar consulta", "Emergência", "Falar no WhatsApp"]
     },
     "Pet Shop": {
         primary: "#10b981", // emerald-500
@@ -3508,7 +3536,8 @@ const NICHE_TEMPLATES = {
             "https://images.unsplash.com/photo-1548199973-03cce0bbc87b?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1516734212186-a967f81ad0d7?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1591768793355-74d7af73a7e6?auto=format&fit=crop&w=400&q=80"
-        ]
+        ],
+        chatbotFallback: ["Banho e tosa", "Horários", "Falar no WhatsApp"]
     },
     "Restaurante": {
         primary: "#991b1b", // red-800 (dark red)
@@ -3526,7 +3555,8 @@ const NICHE_TEMPLATES = {
             "https://images.unsplash.com/photo-1552566626-52f8b828add9?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1467003909585-2f8a72700288?auto=format&fit=crop&w=400&q=80"
-        ]
+        ],
+        chatbotFallback: ["Ver cardápio", "Fazer reserva", "Falar no WhatsApp"]
     },
     "Prestadores de Serviço": {
         primary: "#3b82f6", // blue-500
@@ -3544,7 +3574,84 @@ const NICHE_TEMPLATES = {
             "https://images.unsplash.com/photo-1595841055112-5c245b890591?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1621905251189-08b45d6a269e?auto=format&fit=crop&w=400&q=80",
             "https://images.unsplash.com/photo-1558403194-611308249627?auto=format&fit=crop&w=400&q=80"
-        ]
+        ],
+        chatbotFallback: ["Pedir orçamento", "Ver serviços", "Falar no WhatsApp"]
+    },
+    "Mecânica": {
+        primary: "#ea580c", // orange-600
+        secondary: "#111827", // gray-900
+        accent: "#f97316", // orange-500
+        heroImages: [
+            "https://images.unsplash.com/photo-1486262715619-67b85e0b08d3?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1530046339160-ce3e5b0c7a2f?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1619642751034-765dfdf7c58e?auto=format&fit=crop&w=1200&q=80"
+        ],
+        services: ["Revisão Geral", "Troca de Óleo", "Freios e Suspensão", "Injeção Eletrônica", "Alinhamento e Balanceamento"],
+        galleryImages: [
+            "https://images.unsplash.com/photo-1530046339160-ce3e5b0c7a2f?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1619642751034-765dfdf7c58e?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1486262715619-67b85e0b08d3?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1507702553912-a15641e827c8?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1517524008410-b44336d29a0c?auto=format&fit=crop&w=400&q=80"
+        ],
+        chatbotFallback: ["Pedir orçamento", "Agendar revisão", "Falar no WhatsApp"]
+    },
+    "Advogado": {
+        primary: "#1e293b", // slate-800
+        secondary: "#f8fafc", // slate-50
+        accent: "#94a3b8", // slate-400
+        heroImages: [
+            "https://images.unsplash.com/photo-1589829545856-d10d557cf95f?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1505664194779-8beaceb93744?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1453722758826-58c8b24a5a44?auto=format&fit=crop&w=1200&q=80"
+        ],
+        services: ["Direito Civil", "Direito do Trabalho", "Direito de Família", "Assessoria Jurídica", "Causas Imobiliárias"],
+        galleryImages: [
+            "https://images.unsplash.com/photo-1589829545856-d10d557cf95f?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1505664194779-8beaceb93744?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1453722758826-58c8b24a5a44?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1473186578172-c141e6798ee4?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1521791055366-0d553872125f?auto=format&fit=crop&w=400&q=80"
+        ],
+        chatbotFallback: ["Agendar consulta", "Áreas de atuação", "Falar no WhatsApp"]
+    },
+    "Psicólogo": {
+        primary: "#0d9488", // teal-600
+        secondary: "#f0fdfa", // teal-50
+        accent: "#5eead4", // teal-300
+        heroImages: [
+            "https://images.unsplash.com/photo-1573497019940-1c28c88b4f3e?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1527137342181-19aab11a8ee1?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1516534775068-ba3e7458af70?auto=format&fit=crop&w=1200&q=80"
+        ],
+        services: ["Terapia Individual", "Terapia de Casal", "Psicoterapia Infantil", "Orientação Vocacional", "Acompanhamento Terapêutico"],
+        galleryImages: [
+            "https://images.unsplash.com/photo-1573497019940-1c28c88b4f3e?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1527137342181-19aab11a8ee1?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1516534775068-ba3e7458af70?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1499750310107-5fef28a66643?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1544027993-37dbfe43562a?auto=format&fit=crop&w=400&q=80"
+        ],
+        chatbotFallback: ["Agendar sessão", "Como funciona", "Falar no WhatsApp"]
+    },
+    "Academia": {
+        primary: "#dc2626", // red-600
+        secondary: "#0f172a", // slate-900
+        accent: "#ef4444", // red-500
+        heroImages: [
+            "https://images.unsplash.com/photo-1534438327276-14e5300c3a48?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1517836357463-d25dfeac3438?auto=format&fit=crop&w=1200&q=80",
+            "https://images.unsplash.com/photo-1571902943202-507ec2618e8f?auto=format&fit=crop&w=1200&q=80"
+        ],
+        services: ["Musculação", "Treinamento Funcional", "Crossfit", "Yoga & Pilates", "Consultoria Fitness"],
+        galleryImages: [
+            "https://images.unsplash.com/photo-1534438327276-14e5300c3a48?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1517836357463-d25dfeac3438?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1571902943202-507ec2618e8f?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1540497077202-7c8a3999166f?auto=format&fit=crop&w=400&q=80",
+            "https://images.unsplash.com/photo-1593079831268-3381b0db4a77?auto=format&fit=crop&w=400&q=80"
+        ],
+        chatbotFallback: ["Ver planos", "Agendar aula", "Falar no WhatsApp"]
     }
 };
 
@@ -3552,15 +3659,33 @@ function getTemplateForNiche(niche, leadName, category) {
     const name = (leadName || "").toLowerCase();
     const cat = (category || "").toLowerCase();
     const n = (niche || "").toLowerCase();
+    const text = (name + " " + cat + " " + n);
     
     let template = NICHE_TEMPLATES["Prestadores de Serviço"];
     
-    if (name.includes('barbearia') || name.includes('barber') || cat === 'barber_shop') template = NICHE_TEMPLATES["Barbearia"];
-    else if (name.includes('dentista') || name.includes('odonto') || cat === 'dentist') template = NICHE_TEMPLATES["Dentista"];
-    else if (n.includes('salão') || n.includes('beleza') || cat === 'beauty_salon' || cat === 'hair_care') template = NICHE_TEMPLATES["Salão de Beleza"];
-    else if (n.includes('pet') || n.includes('veterinária') || cat === 'pet_store' || cat === 'veterinary_care') template = NICHE_TEMPLATES["Pet Shop"];
-    else if (n.includes('restaurante') || n.includes('padaria') || n.includes('pizzaria') || n.includes('hamburgueria') || cat === 'restaurant' || cat === 'bakery' || cat === 'meal_takeaway') template = NICHE_TEMPLATES["Restaurante"];
-    else if (n.includes('clínica') || n.includes('médica') || n.includes('estética') || cat === 'doctor' || cat === 'hospital' || cat === 'spa') template = NICHE_TEMPLATES["Clínica Estética"];
+    if (text.includes('barbearia') || text.includes('barber') || cat === 'barber_shop') {
+        template = NICHE_TEMPLATES["Barbearia"];
+    } else if (text.includes('dentista') || text.includes('odonto') || text.includes('dente') || cat === 'dentist') {
+        template = NICHE_TEMPLATES["Dentista"];
+    } else if (text.includes('salão') || text.includes('salao') || text.includes('beleza') || text.includes('cabelo') || cat === 'beauty_salon' || cat === 'hair_care') {
+        template = NICHE_TEMPLATES["Salão de Beleza"];
+    } else if (text.includes('pet') || text.includes('animal') || text.includes('veterinária') || text.includes('veterinaria') || text.includes('vet') || cat === 'pet_store' || cat === 'veterinary_care') {
+        template = NICHE_TEMPLATES["Pet Shop"];
+    } else if (text.includes('restaurante') || text.includes('padaria') || text.includes('pizzaria') || text.includes('hamburgueria') || text.includes('comida') || text.includes('gastronomia') || text.includes('bar') || text.includes('café') || cat === 'restaurant' || cat === 'bakery' || cat === 'meal_takeaway') {
+        template = NICHE_TEMPLATES["Restaurante"];
+    } else if (text.includes('clínica') || text.includes('clinica') || text.includes('médica') || text.includes('medica') || text.includes('estética') || text.includes('estetica') || cat === 'doctor' || cat === 'hospital' || cat === 'spa') {
+        template = NICHE_TEMPLATES["Clínica Estética"];
+    } else if (text.includes('mecânica') || text.includes('mecanica') || text.includes('oficina') || text.includes('carro') || text.includes('automotivo') || cat === 'car_repair') {
+        template = NICHE_TEMPLATES["Mecânica"];
+    } else if (text.includes('advogado') || text.includes('jurídico') || text.includes('direito') || text.includes('advocacia') || cat === 'lawyer') {
+        template = NICHE_TEMPLATES["Advogado"];
+    } else if (text.includes('psicólogo') || text.includes('psicologo') || text.includes('terapia') || text.includes('psicologia') || text.includes('mental')) {
+        template = NICHE_TEMPLATES["Psicólogo"];
+    } else if (text.includes('academia') || text.includes('fitness') || text.includes('treino') || text.includes('gym') || cat === 'gym') {
+        template = NICHE_TEMPLATES["Academia"];
+    } else if (text.includes('ar condicionado') || text.includes('eletricista') || text.includes('encanador') || text.includes('reforma') || text.includes('pintura') || text.includes('limpeza') || text.includes('manutenção') || text.includes('manutencao')) {
+        template = NICHE_TEMPLATES["Prestadores de Serviço"];
+    }
     
     // Randomize images from the template
     const result = { ...template };
@@ -3568,9 +3693,9 @@ function getTemplateForNiche(niche, leadName, category) {
         result.heroImg = result.heroImages[Math.floor(Math.random() * result.heroImages.length)];
     }
     if (result.galleryImages) {
-        // Pick 3 random gallery images
+        // Pick 5 random gallery images if available
         const shuffled = [...result.galleryImages].sort(() => 0.5 - Math.random());
-        result.gallery = shuffled.slice(0, 3);
+        result.gallery = shuffled.slice(0, 5);
     }
     
     return result;
@@ -3624,17 +3749,6 @@ function openDemoGenerator(leadId) {
     render();
 }
 
-function openSiteGenerator(leadId) {
-    const lead = state.leads.find(l => l.id === leadId);
-    if (!lead) return;
-    state.selectedLeadForSite = lead;
-    state.siteDraft = "";
-    state.isGeneratingSite = false;
-    render();
-}
-
-window.openSiteGenerator = openSiteGenerator;
-
 async function generateDemoSite(leadId, mode = 'auto', customData = null, variation = 1) {
     const lead = state.leads.find(l => l.id === leadId);
     if (!lead) return;
@@ -3642,9 +3756,30 @@ async function generateDemoSite(leadId, mode = 'auto', customData = null, variat
     state.selectedLeadForSite = lead;
     state.isGeneratingSite = true;
     state.siteGenerationMode = mode;
+    state.currentShareUrl = null;
     render();
     
     try {
+        // Ensure we have photos if available
+        if ((!lead.photos || lead.photos.length === 0) && lead.placeId) {
+            try {
+                const headers = {};
+                const cleanMapsKey = (state.googleMapsKey || "").trim().replace(/["']/g, '').replace(/\s/g, '');
+                if (cleanMapsKey) headers['x-goog-api-key'] = cleanMapsKey;
+                
+                const detailsRes = await fetch(`/api/details?placeId=${lead.placeId}`, { headers });
+                if (detailsRes.ok) {
+                    const details = await detailsRes.json();
+                    if (details.photos && details.photos.length > 0) {
+                        lead.photos = details.photos.map(p => p.name);
+                        saveLeads();
+                    }
+                }
+            } catch (err) {
+                console.error("Error fetching details during site generation:", err);
+            }
+        }
+
         let brandingColors = null;
         if (mode === 'auto') {
             brandingColors = await getBrandingColors(lead);
@@ -3745,8 +3880,9 @@ const GIO_FASHION_TEMPLATE = {
 };
 
 function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors = null, variation = 1) {
-    const categoryText = lead.category || lead.niche || "Serviços Profissionais de Alta Qualidade";
-    const cleanCategory = (categoryText.toLowerCase().includes('undefined') || categoryText.length < 3) ? "Excelência em Atendimento Especializado" : categoryText;
+    const categoryText = lead.category || lead.niche || "Serviços Profissionais";
+    const cleanCategory = (categoryText.toLowerCase().includes('undefined') || categoryText.length < 3) ? "Atendimento Especializado" : categoryText;
+    const cleanCity = lead.city || "sua região";
     
     let baseTemplate = mode === 'template' ? GIO_FASHION_TEMPLATE : getTemplateForNiche(lead.niche, lead.name, lead.category);
     
@@ -3773,25 +3909,127 @@ function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors 
     const whatsappUrl = lead.whatsapp_url || getWhatsAppUrl(lead.phone);
     const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(lead.name)}&query_place_id=${lead.placeId}`;
 
+    // Priority 1: Manual Uploads, Priority 2: Google Photos, Priority 3: Fallback
+    const getPhotoForPlacement = (placement, fallback) => {
+        const manual = state.uploadedPhotos.find(p => p.placement === placement);
+        return manual ? manual.url : fallback;
+    };
+
+    const getPhotosForPlacement = (placement, fallbackArray) => {
+        const manual = state.uploadedPhotos.filter(p => p.placement === placement).map(p => p.url);
+        if (manual.length > 0) {
+            return manual;
+        }
+        return fallbackArray;
+    };
+
     // Get real photos from Google if available
     const cleanMapsKey = (state.googleMapsKey || "").trim().replace(/["']/g, '').replace(/\s/g, '');
-    let heroImg = template.heroImg;
-    let gallery = [...template.gallery];
+    
+    const getProxyPhotoUrl = (name, h, w) => {
+        const keyParam = cleanMapsKey ? `&key=${encodeURIComponent(cleanMapsKey)}` : '';
+        return `/api/photo?name=${encodeURIComponent(name)}&maxHeightPx=${h}&maxWidthPx=${w}${keyParam}`;
+    };
 
-    if (lead.photos && lead.photos.length > 0) {
-        // Use first photo as hero
-        heroImg = `https://places.googleapis.com/v1/${lead.photos[0]}/media?key=${cleanMapsKey}&maxHeightPx=1200&maxWidthPx=1920`;
+    // Deterministic shuffle based on lead ID to ensure variety between leads
+    const shuffleArray = (array, seed) => {
+        const shuffled = [...array];
+        let m = shuffled.length, t, i;
+        let seedNum = 0;
+        for (let j = 0; j < seed.length; j++) seedNum += seed.charCodeAt(j);
         
-        // Use remaining photos for gallery
-        const realGalleryPhotos = lead.photos.slice(1, 4).map(p => 
-            `https://places.googleapis.com/v1/${p}/media?key=${cleanMapsKey}&maxHeightPx=800&maxWidthPx=800`
-        );
+        while (m) {
+            i = Math.floor((Math.abs(Math.sin(seedNum++)) * 10000) % m--);
+            t = shuffled[m];
+            shuffled[m] = shuffled[i];
+            shuffled[i] = t;
+        }
+        return shuffled;
+    };
+
+    // Image Pool Management
+    let allRealPhotos = lead.photos && lead.photos.length > 0 ? [...lead.photos] : [];
+    let heroPhoto = null;
+    
+    if (allRealPhotos.length > 0) {
+        // Priority: Use the first photo (usually the cover/best) for the hero
+        heroPhoto = allRealPhotos.shift();
         
-        // Fill gallery with real photos, fallback to template if not enough
-        for (let i = 0; i < realGalleryPhotos.length; i++) {
-            gallery[i] = realGalleryPhotos[i];
+        // Shuffle the remaining photos for variety in other sections
+        if (allRealPhotos.length > 1) {
+            allRealPhotos = shuffleArray(allRealPhotos, lead.id);
         }
     }
+
+    const nicheKeywords = {
+        "Salão de Beleza": "beauty,salon,hair,makeup",
+        "Barbearia": "barber,shave,haircut",
+        "Clínica Estética": "clinic,spa,skincare,facial",
+        "Dentista": "dentist,teeth,dental,clinic",
+        "Pet Shop": "pet,dog,cat,grooming",
+        "Restaurante": "food,restaurant,dining,chef",
+        "Mecânica": "car,mechanic,engine,garage",
+        "Advogado": "law,office,legal,court",
+        "Psicólogo": "therapy,office,consultation",
+        "Academia": "gym,fitness,workout,training",
+        "Imobiliária": "real estate,house,apartment",
+        "Contabilidade": "accounting,office,finance",
+        "Arquitetura": "architecture,design,building",
+        "Engenharia": "engineering,construction",
+        "Educação": "school,education,learning",
+        "Saúde": "health,medical,hospital",
+        "Moda": "fashion,clothing,store",
+        "Tecnologia": "technology,software,office"
+    };
+    const kw = nicheKeywords[lead.niche] || nicheKeywords[lead.category] || "business,service,office";
+
+    let photoPoolIndex = 0;
+    const getNextPhoto = (h, w, fallbackSeed) => {
+        if (allRealPhotos.length > 0) {
+            const photo = allRealPhotos[photoPoolIndex % allRealPhotos.length];
+            photoPoolIndex++;
+            return getProxyPhotoUrl(photo, h, w);
+        }
+        // Fallback to varied picsum images
+        const seed = `${lead.id}_${fallbackSeed}_${variation}_${photoPoolIndex}`;
+        photoPoolIndex++;
+        return `https://picsum.photos/seed/${seed}/${w}/${h}`;
+    };
+
+    // Assign unique photos to each section to avoid repetition
+    let heroImg = heroPhoto ? getProxyPhotoUrl(heroPhoto, 1200, 1920) : getNextPhoto(1200, 1920, "hero");
+    let aboutImg = getNextPhoto(800, 1200, "about");
+    
+    let gallery = [];
+    for (let i = 0; i < 6; i++) {
+        gallery.push(getNextPhoto(800, 800, `gallery_${i}`));
+    }
+
+    let servicesPhotos = [];
+    for (let i = 0; i < 6; i++) {
+        servicesPhotos.push(getNextPhoto(600, 800, `service_${i}`));
+    }
+
+    let teamPhotos = [];
+    for (let i = 0; i < 3; i++) {
+        teamPhotos.push(getNextPhoto(800, 600, `team_${i}`));
+    }
+
+    let testimonialPhotos = [];
+    for (let i = 0; i < 4; i++) {
+        testimonialPhotos.push(getNextPhoto(400, 400, `customer_${i}`));
+    }
+
+    let footerImg = getNextPhoto(800, 1200, "footer");
+
+    // Apply Manual Overrides
+    heroImg = getPhotoForPlacement('hero', heroImg);
+    gallery = getPhotosForPlacement('gallery', gallery);
+    const finalAboutImg = getPhotoForPlacement('about', aboutImg);
+    const finalServicesPhotos = getPhotosForPlacement('services', servicesPhotos);
+    const finalTeamPhotos = getPhotosForPlacement('team', teamPhotos);
+    const finalTestimonialPhotos = getPhotosForPlacement('testimonials', testimonialPhotos);
+    const finalFooterImg = getPhotoForPlacement('footer', footerImg);
 
     if (mode === 'clone' && customData) {
         return customData.html; // Gemini generated HTML
@@ -3800,22 +4038,32 @@ function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors 
     // Dynamic Services based on category
     const services = template.services || ["Atendimento Personalizado", "Consultoria Especializada", "Serviços de Alta Qualidade"];
 
+    const layoutId = state.currentSiteLayout || 1;
+    
     // Template specific styles
     let bodyClass = "bg-white text-slate-900";
     let navClass = "bg-white/80 backdrop-blur-md border-b border-slate-100";
     let heroClass = "bg-slate-50";
-    
-    if (selectedLayout.theme === 'luxury') {
+    let primaryColor = template.primary;
+    let fontSerif = "'Playfair Display', serif";
+    let fontSans = "'Inter', sans-serif";
+
+    if (layoutId === 2) { // Minimal
+        bodyClass = "bg-white text-slate-800 font-light";
+        navClass = "bg-white/50 backdrop-blur-sm";
+        heroClass = "bg-white border-b border-slate-50";
+        fontSerif = "'Inter', sans-serif";
+    } else if (layoutId === 3) { // Luxury
         bodyClass = "bg-[#050505] text-white selection:bg-white selection:text-black";
         navClass = "bg-black/20 backdrop-blur-md border-b border-white/10";
         heroClass = "bg-black";
-    } else if (selectedLayout.theme === 'modern') {
-        bodyClass = "bg-slate-50 text-slate-900";
-        navClass = "bg-white/90 backdrop-blur-md shadow-sm";
-    } else if (selectedLayout.theme === 'minimal') {
-        bodyClass = "bg-white text-slate-800";
-        navClass = "bg-white border-b border-slate-50";
-        heroClass = "bg-white";
+        primaryColor = "#D4AF37"; // Gold
+        fontSerif = "'Cormorant Garamond', serif";
+    } else if (layoutId === 4) { // Editorial
+        bodyClass = "bg-[#f5f5f0] text-[#1a1a1a]";
+        navClass = "bg-transparent absolute";
+        heroClass = "bg-[#f5f5f0]";
+        fontSerif = "'Libre Baskerville', serif";
     }
 
     return `
@@ -3826,16 +4074,16 @@ function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors 
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${lead.name} | ${cleanCategory}</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=Inter:wght@300;400;600;800&family=Outfit:wght@300;400;600;900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;700;900&family=Playfair+Display:ital,wght@0,400;0,900;1,400&family=Cormorant+Garamond:ital,wght@0,300;0,700;1,400&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
     <style>
         :root {
-            --primary: ${template.primary};
-            --secondary: ${template.secondary};
-            --accent: ${template.accent || template.primary};
+            --primary: ${primaryColor};
+            --font-serif: ${fontSerif};
+            --font-sans: ${fontSans};
         }
-        body { font-family: 'Inter', sans-serif; }
-        .serif { font-family: 'Playfair Display', serif; }
-        .outfit { font-family: 'Outfit', sans-serif; }
+        
+        body { font-family: var(--font-sans); }
+        .serif { font-family: var(--font-serif); }
         
         .bg-primary { background-color: var(--primary); }
         .text-primary { color: var(--primary); }
@@ -3888,7 +4136,7 @@ function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors 
                 <span class="text-[10px] font-black uppercase tracking-[0.4em] opacity-60 block">Bem-vindo ao ${lead.name}</span>
                 <h1 class="serif text-6xl md:text-9xl font-black leading-tight tracking-tighter">
                     ${cleanCategory} <br>
-                    <span class="italic font-normal opacity-80">em ${lead.city}.</span>
+                    <span class="italic font-normal opacity-80">em ${cleanCity}.</span>
                 </h1>
             </div>
             
@@ -3927,7 +4175,7 @@ function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors 
                 </div>
                 
                 <p class="text-lg opacity-70 font-light leading-relaxed">
-                    Localizados em ${lead.city}, o ${lead.name} é referência em ${cleanCategory}. 
+                    Localizados em ${cleanCity}, o ${lead.name} é referência em ${cleanCategory}. 
                     Nossa missão é transformar cada atendimento em uma experiência única de satisfação e confiança.
                 </p>
 
@@ -3944,7 +4192,7 @@ function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors 
             </div>
             
             <div class="relative">
-                <img src="${gallery[0]}" class="rounded-[2rem] shadow-2xl w-full h-[500px] object-cover" alt="Ambiente" referrerpolicy="no-referrer">
+                <img src="${finalAboutImg}" class="rounded-[2rem] shadow-2xl w-full h-[500px] object-cover" alt="Ambiente" referrerpolicy="no-referrer">
                 <div class="absolute -bottom-10 -left-10 bg-primary text-white p-10 rounded-[2rem] hidden md:block shadow-2xl">
                     <div class="serif text-3xl font-black mb-2">Qualidade</div>
                     <div class="text-[10px] font-black uppercase tracking-widest opacity-70">Garantida em cada detalhe</div>
@@ -3982,14 +4230,64 @@ function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors 
 
             <div class="grid md:grid-cols-3 gap-6">
                 ${services.map((s, i) => `
-                    <div class="p-10 bg-white shadow-sm rounded-[2rem] hover:shadow-xl transition-all group text-left border border-slate-100">
-                        <div class="w-12 h-12 bg-primary/10 text-primary rounded-xl flex items-center justify-center mb-8 group-hover:bg-primary group-hover:text-white transition-all">
-                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                    <div class="p-10 bg-white shadow-sm rounded-[2rem] hover:shadow-xl transition-all group text-left border border-slate-100 overflow-hidden relative">
+                        <div class="absolute inset-0 z-0 opacity-0 group-hover:opacity-10 transition-opacity">
+                            <img src="${finalServicesPhotos[i % finalServicesPhotos.length]}" class="w-full h-full object-cover" alt="${s}" referrerpolicy="no-referrer">
                         </div>
-                        <h3 class="serif text-2xl font-black mb-4 text-slate-900">${s}</h3>
-                        <p class="text-sm font-light text-slate-500 leading-relaxed">
-                            Serviço especializado de ${cleanCategory} focado em resultados excepcionais para nossos clientes.
-                        </p>
+                        <div class="relative z-10">
+                            <div class="w-12 h-12 bg-primary/10 text-primary rounded-xl flex items-center justify-center mb-8 group-hover:bg-primary group-hover:text-white transition-all">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                            </div>
+                            <h3 class="serif text-2xl font-black mb-4 text-slate-900">${s}</h3>
+                            <p class="text-sm font-light text-slate-500 leading-relaxed">
+                                Serviço especializado de ${cleanCategory} focado em resultados excepcionais para nossos clientes.
+                            </p>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+    </section>
+
+    <!-- Team Section -->
+    <section id="equipe" class="py-32 px-6 max-w-7xl mx-auto">
+        <div class="text-center space-y-4 mb-20">
+            <span class="text-[10px] font-black uppercase tracking-[0.4em] opacity-50">Nossos Especialistas</span>
+            <h2 class="serif text-5xl md:text-7xl font-black tracking-tighter">Nossa <span class="italic font-normal opacity-60">Equipe.</span></h2>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-12">
+            ${finalTeamPhotos.map((img, i) => `
+                <div class="space-y-6 group">
+                    <div class="aspect-[3/4] rounded-[2rem] overflow-hidden shadow-xl">
+                        <img src="${img}" class="w-full h-full object-cover transition-transform duration-700 group-hover:scale-110" alt="Membro da Equipe ${i+1}" referrerpolicy="no-referrer">
+                    </div>
+                    <div class="text-center">
+                        <h3 class="serif text-2xl font-black">Especialista ${i+1}</h3>
+                        <p class="text-[10px] font-black uppercase tracking-widest opacity-50">Profissional Sênior</p>
+                    </div>
+                </div>
+            `).join('')}
+        </div>
+    </section>
+
+    <!-- Testimonials Section -->
+    <section id="depoimentos" class="py-32 px-6 bg-primary/5">
+        <div class="max-w-7xl mx-auto">
+            <div class="text-center space-y-4 mb-20">
+                <span class="text-[10px] font-black uppercase tracking-[0.4em] opacity-50">Depoimentos</span>
+                <h2 class="serif text-5xl md:text-7xl font-black tracking-tighter">O que dizem <span class="italic font-normal opacity-60">nossos clientes.</span></h2>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                ${finalTestimonialPhotos.map((img, i) => `
+                    <div class="bg-white p-12 rounded-[3rem] shadow-xl flex flex-col md:flex-row gap-8 items-center border border-slate-100">
+                        <img src="${img}" class="w-24 h-24 rounded-full object-cover shadow-lg" alt="Cliente ${i+1}" referrerpolicy="no-referrer">
+                        <div class="space-y-4">
+                            <div class="flex text-amber-400">
+                                ${Array(5).fill(0).map(() => `<svg class="w-4 h-4 fill-current" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`).join('')}
+                            </div>
+                            <p class="italic text-slate-600 font-light">"O atendimento no ${lead.name} superou todas as minhas expectativas. Profissionalismo e qualidade impecáveis!"</p>
+                            <div class="font-black text-xs uppercase tracking-widest">Cliente Satisfeito</div>
+                        </div>
                     </div>
                 `).join('')}
             </div>
@@ -4045,45 +4343,44 @@ function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors 
     </section>
 
     <!-- Footer -->
-    <footer class="py-20 px-6 text-center border-t border-current/5 opacity-50">
-        <div class="serif text-2xl font-black tracking-tighter mb-4">${lead.name}</div>
-        
-        ${lead.instagram_url ? `
-        <div class="flex justify-center gap-6 mb-8">
-            <a href="${lead.instagram_url}" target="_blank" class="opacity-60 hover:opacity-100 transition-opacity flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
-                <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg>
-                Instagram
-            </a>
+    <footer class="py-20 px-6 text-center border-t border-current/5 relative overflow-hidden">
+        <div class="absolute inset-0 z-0 opacity-5">
+            <img src="${finalFooterImg}" class="w-full h-full object-cover" alt="Footer Background" referrerpolicy="no-referrer">
         </div>
-        ` : ''}
+        <div class="relative z-10">
+            <div class="serif text-2xl font-black tracking-tighter mb-4">${lead.name}</div>
+            
+            ${lead.instagram_url ? `
+            <div class="flex justify-center gap-6 mb-8">
+                <a href="${lead.instagram_url}" target="_blank" class="opacity-60 hover:opacity-100 transition-opacity flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
+                    <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919-1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg>
+                    Instagram
+                </a>
+            </div>
+            ` : ''}
 
-        <div class="text-[10px] font-black uppercase tracking-widest opacity-50">
-            © 2024 ${lead.name}. Todos os direitos reservados.
+            <div class="text-[10px] font-black uppercase tracking-widest opacity-50">
+                © 2024 ${lead.name}. Todos os direitos reservados.
+            </div>
         </div>
     </footer>
 
     <!-- Floating WhatsApp -->
-    <a href="${whatsappUrl}" target="_blank" class="fixed bottom-8 right-8 z-[200] bg-[#25D366] text-white p-5 rounded-full shadow-2xl hover:scale-110 transition-all">
+    <a href="${whatsappUrl}" target="_blank" class="fixed bottom-8 right-8 z-[200] bg-[#25D366] text-white p-5 rounded-full shadow-2xl hover:scale-110 transition-all flex items-center justify-center">
         <svg class="w-8 h-8" fill="currentColor" viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
     </a>
+
 </body>
 </html>
     `;
 }
-
-function publishDemo() {
-    state.error = "Demo publicada com sucesso! O link agora é público e pode ser enviado ao cliente.";
-    render();
-}
-
-window.publishDemo = publishDemo;
 
 function getDemoModalHTML() {
     if (!state.selectedLeadForSite) return "";
     
     const lead = state.selectedLeadForSite;
     
-    // If site is not generated yet, show options
+    // If site is not generated yet and not generating, show options (but we now auto-start)
     if (!state.siteDraft && !state.isGeneratingSite) {
         return `
             <div class="fixed inset-0 z-[110] flex items-center justify-center p-4 sm:p-10 bg-slate-900/80 backdrop-blur-md animate-fade-in pointer-events-auto">
@@ -4096,6 +4393,66 @@ function getDemoModalHTML() {
                     </div>
                     
                     <div class="p-10 grid grid-cols-1 gap-12 overflow-y-auto">
+                        <!-- Manual Photo Upload Section -->
+                        <div class="p-8 bg-indigo-50 border-2 border-indigo-100 rounded-[2.5rem] space-y-6">
+                            <div class="flex items-center justify-between">
+                                <div class="flex items-center gap-4">
+                                    <div class="w-12 h-12 bg-indigo-600 text-white rounded-xl flex items-center justify-center">
+                                        <i data-lucide="camera" class="w-6 h-6"></i>
+                                    </div>
+                                    <div>
+                                        <h3 class="text-lg font-black">Fotos do Cliente</h3>
+                                        <p class="text-[10px] text-indigo-600 font-bold uppercase tracking-widest">Upload manual para o site demo</p>
+                                    </div>
+                                </div>
+                                <label class="px-6 py-3 bg-indigo-600 text-white rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-indigo-700 transition-all cursor-pointer active:scale-95 flex items-center gap-2">
+                                    <i data-lucide="upload" class="w-3 h-3"></i>
+                                    Upload de fotos
+                                    <input type="file" multiple accept="image/*" class="hidden" onchange="handleManualPhotoUpload(event)">
+                                </label>
+                            </div>
+
+                            ${state.uploadedPhotos.length > 0 ? `
+                                <div class="flex items-center justify-between px-4 py-3 bg-white border border-indigo-100 rounded-2xl">
+                                    <p class="text-[10px] font-black text-indigo-900 uppercase tracking-widest">Fotos prontas para o site</p>
+                                    <button onclick="generateDemoSite('${lead.id}', 'auto', null, state.currentSiteLayout || 1)" class="px-4 py-2 bg-emerald-500 text-white rounded-lg font-black text-[9px] uppercase tracking-widest hover:bg-emerald-600 transition-all flex items-center gap-2">
+                                        <i data-lucide="refresh-cw" class="w-3 h-3"></i>
+                                        Regerar Site com Fotos
+                                    </button>
+                                </div>
+                                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                    ${state.uploadedPhotos.map(photo => `
+                                        <div class="bg-white p-4 rounded-2xl border border-indigo-100 shadow-sm space-y-3 group relative">
+                                            <button onclick="removeUploadedPhoto('${photo.id}')" class="absolute -top-2 -right-2 w-6 h-6 bg-red-500 text-white rounded-full flex items-center justify-center shadow-lg opacity-0 group-hover:opacity-100 transition-opacity z-10">
+                                                <i data-lucide="x" class="w-3 h-3"></i>
+                                            </button>
+                                            <div class="aspect-video rounded-xl overflow-hidden bg-slate-100">
+                                                <img src="${photo.url}" class="w-full h-full object-cover" alt="${photo.name}">
+                                            </div>
+                                            <div class="space-y-1">
+                                                <div class="text-[9px] font-black text-slate-400 uppercase tracking-widest truncate">${photo.name}</div>
+                                                <select onchange="updatePhotoPlacement('${photo.id}', this.value)" class="w-full p-2 bg-slate-50 border border-slate-100 rounded-lg text-[10px] font-bold outline-none focus:border-indigo-500 transition-all">
+                                                    <option value="hero" ${photo.placement === 'hero' ? 'selected' : ''}>Capa / Hero</option>
+                                                    <option value="gallery" ${photo.placement === 'gallery' ? 'selected' : ''}>Galeria</option>
+                                                    <option value="about" ${photo.placement === 'about' ? 'selected' : ''}>Sobre a empresa</option>
+                                                    <option value="services" ${photo.placement === 'services' ? 'selected' : ''}>Serviços</option>
+                                                    <option value="team" ${photo.placement === 'team' ? 'selected' : ''}>Equipe</option>
+                                                    <option value="testimonials" ${photo.placement === 'testimonials' ? 'selected' : ''}>Depoimentos</option>
+                                                    <option value="footer" ${photo.placement === 'footer' ? 'selected' : ''}>Rodapé</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            ` : `
+                                <div class="py-10 border-2 border-dashed border-indigo-200 rounded-3xl flex flex-col items-center justify-center text-center space-y-2 opacity-60">
+                                    <i data-lucide="image-plus" class="w-8 h-8 text-indigo-400"></i>
+                                    <p class="text-xs font-bold text-indigo-900 uppercase tracking-widest">Nenhuma foto enviada</p>
+                                    <p class="text-[10px] text-indigo-600 font-medium">As fotos enviadas terão prioridade sobre as do Google Maps</p>
+                                </div>
+                            `}
+                        </div>
+
                         <!-- Model Selector -->
                         <div class="space-y-6">
                             <div class="flex items-center justify-between">
@@ -4214,20 +4571,41 @@ function getDemoModalHTML() {
                 </div>
 
                 <div class="flex items-center gap-2 sm:gap-4">
-                    <button onclick="copyDemoLink()" 
-                            class="p-4 sm:px-6 sm:py-3 bg-white/10 hover:bg-white/20 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center gap-2">
-                        <i data-lucide="copy" class="w-4 h-4"></i>
-                        <span class="hidden lg:inline">Copiar Link</span>
+                    <button onclick="generateDemoSite('${lead.id}', 'auto', null, (state.currentSiteLayout % 4) + 1)" 
+                            class="p-4 sm:px-6 sm:py-3 bg-white/10 hover:bg-white/20 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center gap-2 text-amber-400">
+                        <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                        <span class="hidden lg:inline">Outra Versão</span>
                     </button>
+
+                    ${!state.currentShareUrl ? `
+                        <button onclick="publishDemo()" 
+                                class="px-8 py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all shadow-lg shadow-emerald-900/20 flex items-center gap-2 ${state.isPublishing ? 'opacity-50 cursor-wait' : ''}">
+                            <i data-lucide="${state.isPublishing ? 'loader-2' : 'cloud-upload'}" class="w-4 h-4 ${state.isPublishing ? 'animate-spin' : ''}"></i>
+                            <span>${state.isPublishing ? 'Publicando...' : 'Publicar Demo'}</span>
+                        </button>
+                    ` : `
+                        <button onclick="copyDemoLink()" 
+                                class="p-4 sm:px-6 sm:py-3 bg-white/10 hover:bg-white/20 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center gap-2 text-emerald-400">
+                            <i data-lucide="copy" class="w-4 h-4"></i>
+                            <span class="hidden lg:inline">Copiar Link</span>
+                        </button>
+                        <button onclick="shareOnWhatsApp()" 
+                                class="p-4 sm:px-6 sm:py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center gap-2 shadow-lg shadow-emerald-900/20">
+                            <i data-lucide="message-circle" class="w-4 h-4"></i>
+                            <span class="hidden lg:inline">WhatsApp</span>
+                        </button>
+                    `}
+                    
+                    <button onclick="downloadSiteAsZip()" 
+                            class="p-4 sm:px-6 sm:py-3 bg-white/10 hover:bg-white/20 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center gap-2">
+                        <i data-lucide="download" class="w-4 h-4"></i>
+                        <span class="hidden lg:inline">Baixar ZIP</span>
+                    </button>
+                    
                     <button onclick="openDemoInNewTab()" 
                             class="p-4 sm:px-6 sm:py-3 bg-white/10 hover:bg-white/20 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all flex items-center gap-2">
                         <i data-lucide="external-link" class="w-4 h-4"></i>
-                        <span class="hidden lg:inline">Abrir em nova aba</span>
-                    </button>
-                    <button onclick="publishDemo()" 
-                            class="px-8 py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all shadow-lg shadow-emerald-900/20 flex items-center gap-2">
-                        <i data-lucide="send" class="w-4 h-4"></i>
-                        <span>Publicar Demo</span>
+                        <span class="hidden lg:inline">Nova Aba</span>
                     </button>
                 </div>
             </div>
@@ -4255,6 +4633,38 @@ function getDemoModalHTML() {
     `;
 }
 
+function handleManualPhotoUpload(event) {
+    const files = Array.from(event.target.files);
+    if (files.length === 0) return;
+
+    files.forEach(file => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            state.uploadedPhotos.push({
+                id: Math.random().toString(36).substr(2, 9),
+                url: e.target.result,
+                name: file.name,
+                placement: 'gallery' // Default to gallery
+            });
+            render();
+        };
+        reader.readAsDataURL(file);
+    });
+}
+
+function updatePhotoPlacement(id, placement) {
+    const photo = state.uploadedPhotos.find(p => p.id === id);
+    if (photo) {
+        photo.placement = placement;
+        render();
+    }
+}
+
+function removeUploadedPhoto(id) {
+    state.uploadedPhotos = state.uploadedPhotos.filter(p => p.id !== id);
+    render();
+}
+
 function handleScreenshotUpload(event, leadId) {
     const file = event.target.files[0];
     if (!file) return;
@@ -4265,34 +4675,6 @@ function handleScreenshotUpload(event, leadId) {
     };
     reader.readAsDataURL(file);
 }
-
-// Update the iframe content after render
-const originalRender = render;
-window.render = function() {
-    originalRender();
-    
-    // Demo Preview Frame
-    if (state.selectedLeadForSite && state.siteDraft && !state.isGeneratingSite) {
-        const frame = document.getElementById('demo-preview-frame');
-        if (frame) {
-            const doc = frame.contentDocument || frame.contentWindow.document;
-            doc.open();
-            doc.write(state.siteDraft);
-            doc.close();
-        }
-    }
-    
-    // Smart Prospecting Preview Frame
-    if (state.selectedLeadForSmartProspecting && state.siteDraft && !state.isGeneratingSite) {
-        const frame = document.getElementById('smart-preview-frame');
-        if (frame) {
-            const doc = frame.contentDocument || frame.contentWindow.document;
-            doc.open();
-            doc.write(state.siteDraft);
-            doc.close();
-        }
-    }
-};
 
 function openDemoInNewTab() {
     if (!state.siteDraft) return;
@@ -4540,22 +4922,6 @@ function getAuditPanelHTML() {
     `;
 }
 
-function copyDemoLink() {
-    if (!state.selectedLeadForSite) return;
-    // For now, we'll copy the HTML to clipboard as a fallback or a data URL
-    // A real link would require server-side hosting
-    const blob = new Blob([state.siteDraft], { type: 'text/html' });
-    const reader = new FileReader();
-    reader.onload = function(e) {
-        const dataUrl = e.target.result;
-        navigator.clipboard.writeText(dataUrl).then(() => {
-            state.error = "Link da demo (Data URL) copiado! Cole no navegador para ver.";
-            render();
-        });
-    };
-    reader.readAsDataURL(blob);
-}
-
 window.toggleLeadSelection = toggleLeadSelection;
 window.sendMessageAssistant = sendMessageAssistant;
 
@@ -4711,6 +5077,7 @@ function previewLibrarySite(siteId) {
     state.selectedLeadForSite = lead;
     state.siteDraft = site.html;
     state.siteGenerationMode = site.mode;
+    state.currentShareUrl = null;
     state.showDemoLibrary = false;
     render();
 }
@@ -4738,7 +5105,6 @@ function deleteLibrarySite(siteId) {
 }
 
 // --- Export functions to window for HTML event handlers ---
-window.render = render;
 window.startRegionalSearch = startRegionalSearch;
 window.startSmartProspectingMode = startSmartProspectingMode;
 window.searchLeads = searchLeads;
@@ -4770,6 +5136,138 @@ window.saveChatbotSettings = saveChatbotSettings;
 window.simulateChatbotMessage = simulateChatbotMessage;
 window.toggleEconomyMode = toggleEconomyMode;
 window.renderChatbot = renderChatbot;
+window.publishDemo = publishDemo;
+window.copyDemoLink = copyDemoLink;
+window.shareOnWhatsApp = shareOnWhatsApp;
+window.downloadSiteAsZip = downloadSiteAsZip;
+window.openDemoInNewTab = openDemoInNewTab;
+
+async function publishDemo() {
+    if (!state.siteDraft) return;
+    
+    try {
+        state.isPublishing = true;
+        render();
+        
+        const response = await fetch('/api/share-site', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ html: state.siteDraft })
+        });
+        
+        if (!response.ok) throw new Error('Falha ao publicar site');
+        
+        const { id } = await response.json();
+        const shareUrl = `${window.location.origin}/share/${id}`;
+        
+        state.currentShareUrl = shareUrl;
+        showToast("Site publicado com sucesso!", "success");
+    } catch (error) {
+        console.error("Publish error:", error);
+        showToast("Erro ao publicar site", "error");
+    } finally {
+        state.isPublishing = false;
+        render();
+    }
+}
+
+function copyDemoLink() {
+    const url = state.currentShareUrl || "";
+    if (!url) {
+        showToast("Publique o site primeiro!", "info");
+        return;
+    }
+    
+    navigator.clipboard.writeText(url).then(() => {
+        showToast("Link copiado para a área de transferência!", "success");
+    });
+}
+
+function shareOnWhatsApp() {
+    const url = state.currentShareUrl || "";
+    if (!url) {
+        showToast("Publique o site primeiro!", "info");
+        return;
+    }
+    
+    const message = `Preparei um exemplo de site para o seu negócio:\n\n${url}\n\nEle mostra serviços, fotos e botão direto para WhatsApp.`;
+    const waUrl = `https://wa.me/?text=${encodeURIComponent(message)}`;
+    window.open(waUrl, '_blank');
+}
+
+async function downloadSiteAsZip() {
+    if (!state.siteDraft) return;
+    
+    try {
+        // We need JSZip
+        if (!window.JSZip) {
+            // Load JSZip from CDN if not present
+            const script = document.createElement('script');
+            script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+            document.head.appendChild(script);
+            await new Promise(resolve => script.onload = resolve);
+        }
+        
+        const zip = new JSZip();
+        zip.file("index.html", state.siteDraft);
+        
+        const content = await zip.generateAsync({ type: "blob" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(content);
+        link.download = `site_demo_${state.selectedLeadForSite.name.toLowerCase().replace(/\s+/g, '_')}.zip`;
+        link.click();
+        
+        showToast("Download iniciado!", "success");
+    } catch (error) {
+        console.error("Download error:", error);
+        showToast("Erro ao baixar ZIP", "error");
+    }
+}
 
 // --- Initial Render ---
+window.render = render;
+window.searchLeads = searchLeads;
+window.startRegionalSearch = startRegionalSearch;
+window.startSmartProspectingMode = startSmartProspectingMode;
+window.enrichLeads = enrichLeads;
+window.downloadCSV = downloadCSV;
+window.clearLeads = clearLeads;
+window.toggleLeadSelection = toggleLeadSelection;
+window.openAuditPanel = openAuditPanel;
+window.startSmartProspecting = startSmartProspecting;
+window.openMeetingModal = openMeetingModal;
+window.openSiteGenerator = openSiteGenerator;
+window.copyProspectingMessage = copyProspectingMessage;
+window.checkRanking = checkRanking;
+window.deleteMeeting = deleteMeeting;
+window.updateMeetingStatus = updateMeetingStatus;
+window.generateDemoSite = generateDemoSite;
+window.removeUploadedPhoto = removeUploadedPhoto;
+window.updatePhotoPlacement = updatePhotoPlacement;
+window.handleManualPhotoUpload = handleManualPhotoUpload;
+window.toggleChatbot = toggleChatbot;
+window.saveChatbotSettings = saveChatbotSettings;
+window.simulateChatbotMessage = simulateChatbotMessage;
+window.verifyKeys = verifyKeys;
+window.saveSettings = saveSettings;
+window.sendMessageAssistant = sendMessageAssistant;
+window.generateSmartMessage = generateSmartMessage;
+window.generateProspectingMessage = generateProspectingMessage;
+window.publishDemo = publishDemo;
+window.copyDemoLink = copyDemoLink;
+window.shareOnWhatsApp = shareOnWhatsApp;
+window.downloadSiteAsZip = downloadSiteAsZip;
+window.openDemoInNewTab = openDemoInNewTab;
+window.previewLibrarySite = previewLibrarySite;
+window.duplicateLibrarySite = duplicateLibrarySite;
+window.deleteLibrarySite = deleteLibrarySite;
+window.calculateOpportunityScore = calculateOpportunityScore;
+window.getOpportunityColor = getOpportunityColor;
+window.getLeadPriorityBadge = getLeadPriorityBadge;
+window.getRankingBadge = getRankingBadge;
+window.getLeadPriorityInfo = getLeadPriorityInfo;
+window.getActionButtonHTML = getActionButtonHTML;
+window.saveLeads = saveLeads;
+window.showToast = showToast;
+
 render();
