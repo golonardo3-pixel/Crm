@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from "@google/genai";
 import fetch from 'node-fetch';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,23 +21,70 @@ if (!process.env.GOOGLE_MAPS_API_KEY) {
 
 app.use(express.json());
 
-// Logging middleware
+// Enhanced logging middleware for all requests
 app.use((req, res, next) => {
-    if (req.url.startsWith('/api')) {
-        console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
-    }
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] ${req.method} ${req.url} - Host: ${req.headers.host}`);
     next();
 });
 
-// In-memory storage for shared sites
-const sharedSites = new Map();
-
 // API routes
 app.get('/api/config', (req, res) => {
+    const protocol = req.headers['x-forwarded-proto'] || 'http';
+    const host = req.headers.host;
+    const currentUrl = `${protocol}://${host}`;
+    
+    const appUrl = process.env.APP_URL || currentUrl;
+    // Force the public 'pre' URL if we are in the 'dev' environment
+    const sharedUrl = process.env.SHARED_APP_URL || appUrl.replace('-dev-', '-pre-');
+    
+    console.log(`[CONFIG] App URL: ${appUrl}, Shared URL: ${sharedUrl}`);
+    
     res.json({
         hasGeminiKey: !!process.env.GEMINI_API_KEY,
-        hasGoogleMapsKey: !!process.env.GOOGLE_MAPS_API_KEY
+        hasGoogleMapsKey: !!process.env.GOOGLE_MAPS_API_KEY,
+        sharedAppUrl: sharedUrl
     });
+});
+
+// Route to get project files for export
+app.get('/api/export-source', (req, res) => {
+    const files = ['index.html', 'script.js', 'style.css', 'server.js', 'package.json', 'vercel.json'];
+    const sourceData = {};
+    
+    files.forEach(file => {
+        const filePath = path.join(__dirname, file);
+        if (fs.existsSync(filePath)) {
+            sourceData[file] = fs.readFileSync(filePath, 'utf8');
+        }
+    });
+    
+    res.json(sourceData);
+});
+
+// Direct ZIP download route
+app.get('/api/download-zip', async (req, res) => {
+    try {
+        const JSZip = (await import('jszip')).default;
+        const zip = new JSZip();
+        const files = ['index.html', 'script.js', 'style.css', 'server.js', 'package.json', 'vercel.json'];
+        
+        files.forEach(file => {
+            const filePath = path.join(__dirname, file);
+            if (fs.existsSync(filePath)) {
+                zip.file(file, fs.readFileSync(filePath));
+            }
+        });
+        
+        const content = await zip.generateAsync({ type: 'nodebuffer' });
+        
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', 'attachment; filename=crm-miner-v2-project.zip');
+        res.send(content);
+    } catch (error) {
+        console.error("Server ZIP error:", error);
+        res.status(500).send("Erro ao gerar ZIP: " + error.message);
+    }
 });
 
 // Middleware to ensure all /api requests return JSON
@@ -446,7 +494,7 @@ app.get('/api/details', async (req, res) => {
             signal: controller.signal,
             headers: {
                 'X-Goog-Api-Key': apiKey,
-                'X-Goog-FieldMask': 'id,displayName,formattedAddress,rating,userRatingCount,websiteUri,nationalPhoneNumber,internationalPhoneNumber,photos,types,editorialSummary'
+                'X-Goog-FieldMask': 'id,displayName,formattedAddress,rating,userRatingCount,websiteUri,nationalPhoneNumber,internationalPhoneNumber,photos,types,editorialSummary,reviews'
             }
         });
         clearTimeout(timeout);
@@ -569,7 +617,22 @@ app.get('/api/photo', async (req, res) => {
     try {
         // name is expected to be like "places/PLACE_ID/photos/PHOTO_REFERENCE"
         const url = `https://places.googleapis.com/v1/${name}/media?key=${apiKey}&maxHeightPx=${maxHeightPx || 1200}&maxWidthPx=${maxWidthPx || 1920}`;
-        res.redirect(url);
+        
+        const response = await fetch(url);
+        if (response.ok) {
+            const contentType = response.headers.get('content-type');
+            if (contentType) res.setHeader('Content-Type', contentType);
+            
+            // Cache for 24 hours
+            res.setHeader('Cache-Control', 'public, max-age=86400');
+            
+            const buffer = await response.buffer();
+            res.send(buffer);
+        } else {
+            console.error(`Error fetching photo from Google: ${response.status} ${response.statusText}`);
+            // Fallback to redirect if proxy fails for some reason
+            res.redirect(url);
+        }
     } catch (error) {
         console.error("Photo proxy error:", error);
         res.status(500).json({ error: "Erro ao acessar Google Photo API" });
@@ -616,42 +679,6 @@ app.get('/api/enrich', async (req, res) => {
         console.error(`Enrichment error for ${url}:`, msg);
         res.status(500).json({ error: msg });
     }
-});
-
-app.post('/api/share-site', (req, res) => {
-    const { html } = req.body;
-    if (!html) return res.status(400).json({ error: "HTML content is required" });
-
-    const id = Math.random().toString(36).substring(2, 15);
-    sharedSites.set(id, html);
-    
-    // Auto-delete after 24 hours to save memory
-    setTimeout(() => sharedSites.delete(id), 24 * 60 * 60 * 1000);
-
-    res.json({ id });
-});
-
-app.get('/share/:id', (req, res) => {
-    const { id } = req.params;
-    const html = sharedSites.get(id);
-    
-    if (!html) {
-        return res.status(404).send('<h1>Site não encontrado ou expirado</h1><p>Links de demonstração expiram após 24 horas.</p>');
-    }
-    
-    res.send(html);
-});
-
-// Serve static files from the root directory
-app.use(express.static(__dirname));
-
-// Global error handler for API
-app.use('/api', (err, req, res, next) => {
-    console.error("API Error Handler:", err);
-    res.status(err.status || 500).json({
-        error: "Erro interno na API",
-        message: err.message || "Ocorreu um erro inesperado no servidor."
-    });
 });
 
 // API 404 handler
