@@ -1,0 +1,28 @@
+{
+  "entities": {
+    "Demo": {
+      "title": "Demo",
+      "description": "A generated website demo for a business.",
+      "type": "object",
+      "properties": {
+        "slug": { "type": "string", "description": "Unique URL slug for the demo." },
+        "businessName": { "type": "string", "description": "Name of the business." },
+        "category": { "type": "string", "description": "Business category." },
+        "images": { "type": "array", "items": { "type": "string" }, "description": "List of image URLs used." },
+        "services": { "type": "array", "items": { "type": "string" }, "description": "List of services offered." },
+        "phone": { "type": "string", "description": "Business phone number." },
+        "address": { "type": "string", "description": "Business address." },
+        "html": { "type": "string", "description": "Full HTML content of the demo site." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Timestamp of creation." },
+        "leadId": { "type": "string", "description": "Original lead ID." }
+      },
+      "required": ["slug", "businessName", "html"]
+    }
+  },
+  "firestore": {
+    "/demos/{demoId}": {
+      "schema": "Demo",
+      "description": "Collection of generated demos."
+    }
+  }
+}

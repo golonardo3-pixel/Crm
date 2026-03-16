@@ -1,0 +1,40 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Assumed Data Model: Demo
+    // - slug: string (required)
+    // - businessName: string (required)
+    // - html: string (required)
+    // - createdAt: timestamp
+    // - leadId: string
+    // - variations: list
+    // - category: string
+    // - phone: string
+    // - address: string
+
+    function isValidDemo(data) {
+      return data.keys().hasAll(['slug', 'businessName', 'html']) &&
+             data.slug is string && data.slug.size() > 0 && data.slug.size() < 200 &&
+             data.businessName is string && data.businessName.size() > 0 && data.businessName.size() < 200 &&
+             data.html is string && data.html.size() > 0 && data.html.size() < 5000000; // 5MB limit
+    }
+
+    match /demos/{demoId} {
+      // Demos are publicly readable so anyone with the link can view the site
+      allow read: if true;
+      
+      // Allow creation if the data is valid
+      // We allow public create because the app's primary flow is a public prospecting tool
+      allow create: if isValidDemo(request.resource.data);
+      
+      // Prevent updates and deletes to maintain integrity of published demos
+      allow update, delete: if false;
+    }
+  }
+}
