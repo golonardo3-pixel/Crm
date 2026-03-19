@@ -429,14 +429,14 @@ function getLinkInBioHTML(lead, template, heroImg, gallery, whatsappUrl, mapsUrl
     // Theme Logic
     const categoryLower = category.toLowerCase();
     let theme = {
-        bg: '#0f172a', // Default dark
-        text: '#f8fafc',
-        cardBg: 'bg-slate-900',
-        cardBorder: 'border-white/5',
-        cardText: 'text-white',
-        cardDesc: 'text-slate-400',
-        profileBorder: 'border-[#0f172a]',
-        bannerOverlay: 'via-[#0f172a]/50 to-[#0f172a]',
+        bg: '#f8fafc', // Light clean background
+        text: '#0f172a', // High contrast text
+        cardBg: 'bg-white',
+        cardBorder: 'border-slate-200',
+        cardText: 'text-slate-900',
+        cardDesc: 'text-slate-500',
+        profileBorder: 'border-slate-200',
+        bannerOverlay: 'via-slate-50/50 to-slate-50',
         accent: primaryColor
     };
 
@@ -448,9 +448,9 @@ function getLinkInBioHTML(lead, template, heroImg, gallery, whatsappUrl, mapsUrl
             cardBorder: 'border-rose-100',
             cardText: 'text-rose-950',
             cardDesc: 'text-rose-700/60',
-            profileBorder: 'border-[#fff5f5]',
+            profileBorder: 'border-slate-200',
             bannerOverlay: 'via-[#fff5f5]/50 to-[#fff5f5]',
-            accent: '#e11d48' // Rose 600
+            accent: primaryColor
         };
     } else if (categoryLower.includes('pet') || categoryLower.includes('veterinaria')) {
         theme = {
@@ -460,9 +460,9 @@ function getLinkInBioHTML(lead, template, heroImg, gallery, whatsappUrl, mapsUrl
             cardBorder: 'border-emerald-100',
             cardText: 'text-emerald-950',
             cardDesc: 'text-emerald-700/60',
-            profileBorder: 'border-[#f0fdf4]',
+            profileBorder: 'border-slate-200',
             bannerOverlay: 'via-[#f0fdf4]/50 to-[#f0fdf4]',
-            accent: '#10b981' // Emerald 500
+            accent: primaryColor
         };
     } else if (categoryLower.includes('restaurante') || categoryLower.includes('pizzaria') || categoryLower.includes('hamburgueria')) {
         theme = {
@@ -472,21 +472,21 @@ function getLinkInBioHTML(lead, template, heroImg, gallery, whatsappUrl, mapsUrl
             cardBorder: 'border-red-100',
             cardText: 'text-red-950',
             cardDesc: 'text-red-700/60',
-            profileBorder: 'border-[#fffcfc]',
+            profileBorder: 'border-slate-200',
             bannerOverlay: 'via-[#fffcfc]/50 to-[#fffcfc]',
-            accent: '#dc2626' // Red 600
+            accent: primaryColor
         };
     } else if (categoryLower.includes('barbearia') || categoryLower.includes('barber')) {
         theme = {
-            bg: '#0a0a0a', // True Dark
-            text: '#ffffff',
-            cardBg: 'bg-neutral-900',
-            cardBorder: 'border-white/10',
-            cardText: 'text-white',
-            cardDesc: 'text-neutral-400',
-            profileBorder: 'border-[#0a0a0a]',
-            bannerOverlay: 'via-[#0a0a0a]/50 to-[#0a0a0a]',
-            accent: '#f59e0b' // Amber 500
+            bg: '#f8fafc', // Light clean background
+            text: '#0f172a',
+            cardBg: 'bg-white',
+            cardBorder: 'border-slate-200',
+            cardText: 'text-slate-900',
+            cardDesc: 'text-slate-500',
+            profileBorder: 'border-slate-200',
+            bannerOverlay: 'via-slate-50/50 to-slate-50',
+            accent: primaryColor
         };
     }
 
@@ -573,14 +573,14 @@ function getLinkInBioHTML(lead, template, heroImg, gallery, whatsappUrl, mapsUrl
 <body class="min-h-screen flex flex-col items-center selection:bg-indigo-500 selection:text-white">
     <!-- Banner -->
     <div class="relative h-64 w-full overflow-hidden">
-        <img src="${gallery[0] || heroImg}" class="w-full h-full object-cover opacity-40 blur-[1px]" alt="Banner" referrerpolicy="no-referrer">
+        <img src="${gallery[0] || heroImg}" class="w-full h-full object-cover opacity-80 blur-[1px]" alt="Banner" referrerpolicy="no-referrer">
         <div class="absolute inset-0 bg-gradient-to-b from-transparent ${theme.bannerOverlay}"></div>
     </div>
 
     <div class="max-w-md w-full px-6 -mt-24 relative z-10 pb-20 space-y-10 animate-fadeIn">
         <!-- Profile -->
         <div class="text-center space-y-6">
-            <div class="w-36 h-36 mx-auto rounded-full overflow-hidden border-4 ${theme.profileBorder} shadow-2xl ring-4 ring-white/5">
+            <div class="w-36 h-36 mx-auto rounded-full overflow-hidden border-[1.5px] ${theme.profileBorder} shadow-sm ring-1 ring-black/5">
                 <img src="${heroImg}" class="w-full h-full object-cover" alt="${name}" referrerpolicy="no-referrer">
             </div>
             <div class="space-y-3">
@@ -615,8 +615,8 @@ function getLinkInBioHTML(lead, template, heroImg, gallery, whatsappUrl, mapsUrl
                 <div class="relative group overflow-hidden rounded-[2.5rem] border ${theme.cardBorder} ${theme.cardBg} shadow-2xl transition-all hover:scale-[1.02]">
                     <!-- Background Image with Overlay -->
                     <div class="absolute inset-0 z-0">
-                        <img src="${card.img}" class="w-full h-full object-cover opacity-30 group-hover:scale-110 transition-transform duration-1000" alt="${card.title}" referrerpolicy="no-referrer">
-                        <div class="absolute inset-0 bg-gradient-to-r from-${theme.bg === '#0f172a' || theme.bg === '#0a0a0a' ? 'slate-900' : 'white'} via-${theme.bg === '#0f172a' || theme.bg === '#0a0a0a' ? 'slate-900/90' : 'white/90'} to-transparent"></div>
+                        <img src="${card.img}" class="w-full h-full object-cover opacity-80 group-hover:scale-110 transition-transform duration-1000" alt="${card.title}" referrerpolicy="no-referrer">
+                        <div class="absolute inset-0 bg-gradient-to-r from-white/60 via-white/20 to-transparent"></div>
                     </div>
                     
                     <!-- Content -->
@@ -639,7 +639,7 @@ function getLinkInBioHTML(lead, template, heroImg, gallery, whatsappUrl, mapsUrl
             <!-- Instagram Special Card -->
             <div class="relative group overflow-hidden rounded-[2.5rem] border ${theme.cardBorder} ${theme.cardBg} shadow-2xl transition-all hover:scale-[1.02]">
                 <div class="absolute inset-0 z-0">
-                    <div class="absolute inset-0 bg-gradient-to-r from-${theme.bg === '#0f172a' || theme.bg === '#0a0a0a' ? 'slate-900' : 'white'} via-${theme.bg === '#0f172a' || theme.bg === '#0a0a0a' ? 'slate-900/60' : 'white/60'} to-transparent"></div>
+                    <div class="absolute inset-0 bg-gradient-to-r from-white via-white/20 to-transparent"></div>
                 </div>
                 <div class="relative z-10 p-8 flex items-center justify-between">
                     <div class="space-y-2">
@@ -657,7 +657,7 @@ function getLinkInBioHTML(lead, template, heroImg, gallery, whatsappUrl, mapsUrl
         <div id="servicos" class="pt-10 space-y-8">
             <div class="flex items-center gap-4">
                 <div class="h-px flex-1 bg-current opacity-10"></div>
-                <h2 class="serif text-2xl font-black">${theme.bg === '#0f172a' || theme.bg === '#0a0a0a' ? 'Destaques' : 'Nossos Serviços'}</h2>
+                <h2 class="serif text-2xl font-black">Nossos Serviços</h2>
                 <div class="h-px flex-1 bg-current opacity-10"></div>
             </div>
             <div class="grid grid-cols-2 gap-4">
@@ -5188,27 +5188,27 @@ async function generateDemoSite(leadId, mode = 'auto', customData = null, variat
                 const shareUrl = `${base}/demo/${id}`;
                 state.currentShareUrl = shareUrl;
                 state.currentVariations = (data.variations || variations).map(v => `${base}/demo/${v}`);
+
+                // Save to library (without full HTML to avoid localStorage quota issues)
+                const newSite = {
+                    id: Date.now().toString(),
+                    slug: id, 
+                    leadId: lead.id,
+                    leadName: lead.name,
+                    category: lead.category || lead.niche || "Serviços Profissionais",
+                    mode: mode,
+                    variation: variation,
+                    date: new Date().toISOString(),
+                    demoUrl: shareUrl
+                };
+                state.demoLibrary.unshift(newSite);
+                // Keep only last 20 demos in library to save space
+                if (state.demoLibrary.length > 20) state.demoLibrary = state.demoLibrary.slice(0, 20);
+                saveDemoLibrary();
             }
         } catch (e) {
             console.error("Error auto-sharing site:", e);
         }
-
-        // Save to library (without full HTML to avoid localStorage quota issues)
-        const newSite = {
-            id: Date.now().toString(),
-            slug: id, 
-            leadId: lead.id,
-            leadName: lead.name,
-            category: lead.category || lead.niche || "Serviços Profissionais",
-            mode: mode,
-            variation: variation,
-            date: new Date().toISOString(),
-            demoUrl: shareUrl
-        };
-        state.demoLibrary.unshift(newSite);
-        // Keep only last 20 demos in library to save space
-        if (state.demoLibrary.length > 20) state.demoLibrary = state.demoLibrary.slice(0, 20);
-        saveDemoLibrary();
         
     } catch (error) {
         console.error('Erro ao gerar site:', error);
@@ -5507,7 +5507,9 @@ function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors 
     let bodyClass = "bg-white text-slate-900";
     let navClass = "bg-white/80 backdrop-blur-md border-b border-slate-100";
     let heroClass = "bg-slate-50";
-    let primaryColor = template.primary;
+    let primaryColor = template.primary || "#4f46e5";
+    let secondaryColor = template.secondary || "#f8fafc";
+    let accentColor = template.accent || "#10b981";
     let fontSerif = "'Playfair Display', serif";
     let fontSans = "'Inter', sans-serif";
 
@@ -5522,22 +5524,27 @@ function getDemoSiteHTML(lead, mode = 'auto', customData = null, brandingColors 
         bodyClass = "bg-white text-slate-800 font-light";
         navClass = "bg-white/50 backdrop-blur-sm";
         heroClass = "bg-white border-b border-slate-50";
+        secondaryColor = "#ffffff";
         fontSerif = "'Inter', sans-serif";
     } else if (layoutId === 3) { // Luxury
         bodyClass = "bg-[#050505] text-white selection:bg-white selection:text-black";
         navClass = "bg-black/20 backdrop-blur-md border-b border-white/10";
         heroClass = "bg-black";
         primaryColor = "#D4AF37"; // Gold
+        secondaryColor = "#0a0a0a";
+        accentColor = "#ffffff";
         fontSerif = "'Cormorant Garamond', serif";
     } else if (layoutId === 4) { // Light/Clean
         bodyClass = "bg-slate-50 text-slate-900";
         navClass = "bg-white/80 backdrop-blur-md border-b border-slate-100";
         heroClass = "bg-white";
+        secondaryColor = "#f8fafc";
         fontSerif = "'Inter', sans-serif";
     } else if (layoutId === 5) { // Editorial
         bodyClass = "bg-[#f5f5f0] text-[#1a1a1a]";
         navClass = "bg-transparent absolute";
         heroClass = "bg-[#f5f5f0]";
+        secondaryColor = "#f5f5f0";
         fontSerif = "'Libre Baskerville', serif";
     }
 
